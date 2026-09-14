@@ -1,6 +1,7 @@
 """Local deferred tools retain the live agent path; batches must not bypass it."""
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +37,9 @@ def test_single_local_unwrap_keeps_session_db_todo_store_and_setup_callback(tmp_
     from agent.tool_executor import _unwrap_tool_search_call
     from agent.agent_runtime_helpers import invoke_tool
     from hermes_state import SessionDB
+    from tools.connectors import live
+    from tools.connectors.contract import SettleReason
+    from tools.connectors.mcp import apply_answer
     from tools.todo_tool import TodoStore
 
     db = SessionDB(tmp_path / "recall.db")
@@ -44,7 +48,16 @@ def test_single_local_unwrap_keeps_session_db_todo_store_and_setup_callback(tmp_
     callbacks = []
     def connection(payload):
         callbacks.append(payload)
-        return json.dumps({"targets": [{"name": t["name"], "status": "declined"} for t in payload["targets"]]})
+
+        def respond():
+            operation = live.get("current-session", payload["op_id"])
+            if operation is not None:
+                apply_answer(operation, json.dumps(
+                    {"targets": [{"name": t["name"], "status": "declined"} for t in payload["targets"]]}))
+                operation.settle(SettleReason.all_resolved)
+
+        threading.Timer(0.02, respond).start()
+        return None
 
     agent = SimpleNamespace(
         enabled_toolsets=["todo", "session_search", "connections"], disabled_toolsets=[],
