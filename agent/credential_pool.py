@@ -1381,9 +1381,9 @@ class CredentialPool(CredentialPoolAdminMixin):
                 # THIS profile's auth.json, so take the dedicated shared-file
                 # lock (inner, per the ordering invariant on ``_auth_store_lock``)
                 # and re-read that authoritative file before any
-                # adopt-and-return shortcut fires. The official ``claude`` CLI
-                # rotating out-of-band is handled by the sync-and-retry-once
-                # fallback in ``_recover_failed_refresh``.
+                # adopt-and-return shortcut fires. Hermes never POSTs this grant:
+                # ``_refresh_anthropic`` refuses and ``_recover_failed_refresh``
+                # adopts the official ``claude`` CLI's rotation or benches the row.
                 with self._claude_code_credentials_lock():
                     synced = self._sync_anthropic_entry_from_credentials_file(synced)
                     if synced.refresh_token != entry.refresh_token:
@@ -1497,6 +1497,10 @@ class CredentialPool(CredentialPoolAdminMixin):
 
     def _refresh_anthropic(self, entry: PooledCredential) -> PooledCredential:
         """POST the Anthropic refresh, commit to the singleton, return the rotated (unpersisted) entry."""
+        if entry.source == "claude_code":
+            # Borrowed grant: only Claude Code may rotate it (see anthropic_credentials._refresh_oauth_token).
+            # Raising routes to _recover_failed_refresh, which adopts Claude Code's rotation or benches the row.
+            raise RuntimeError("claude_code grant is refreshed only by Claude Code")
         from agent.anthropic_credentials import (
             is_rotation_consumed_uncommitted,
             refresh_anthropic_oauth_pure,
@@ -1588,32 +1592,9 @@ class CredentialPool(CredentialPoolAdminMixin):
         """
         if self.provider == "anthropic":
             if entry.source == "claude_code":
+                # Never POST the borrowed grant: adopt Claude Code's own rotation or bench the row.
                 synced = self._sync_anthropic_entry_from_credentials_file(entry)
-                if synced.refresh_token != entry.refresh_token:
-                    logger.debug("Retrying refresh with synced token from credentials file")
-                    try:
-                        from agent.anthropic_credentials import refresh_anthropic_oauth_pure
-                        refreshed = refresh_anthropic_oauth_pure(
-                            synced.refresh_token, use_json=synced.source.endswith("hermes_pkce"),
-                        )
-                        # Commit to the authoritative singleton BEFORE marking or
-                        # persisting the pool row, or a failed write leaves an
-                        # "ok" row that the next load_pool() re-seeds over.
-                        self._commit_anthropic_rotation(synced, refreshed)
-                        return self._adopt(
-                            synced,
-                            access_token=refreshed["access_token"],
-                            refresh_token=refreshed["refresh_token"],
-                            expires_at_ms=refreshed["expires_at_ms"],
-                            last_status=STATUS_OK,
-                            last_status_at=None,
-                            last_error_code=None,
-                        )
-                    except _RefreshDone as done:
-                        return done.result
-                    except Exception as retry_exc:
-                        logger.debug("Retry refresh also failed: %s", retry_exc)
-                elif not self._entry_needs_refresh(synced):
+                if not self._entry_needs_refresh(synced):
                     logger.debug("Credentials file has valid token, using without refresh")
                     return synced
             else:

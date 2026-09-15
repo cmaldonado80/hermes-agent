@@ -398,42 +398,6 @@ class TestRefreshOauthToken:
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
         assert _refresh_oauth_token(creds) is None
 
-    def test_successful_refresh(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("agent.anthropic_credentials.Path.home", lambda: tmp_path)
-        monkeypatch.setattr(
-            "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
-        )
-
-        creds = {
-            "accessToken": "old-token",
-            "refreshToken": "refresh-123",
-            "expiresAt": int(time.time() * 1000) - 3600_000,
-        }
-
-        mock_response = json.dumps({
-            "access_token": "new-token-abc",
-            "refresh_token": "new-refresh-456",
-            "expires_in": 7200,
-        }).encode()
-
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__ = MagicMock(return_value=MagicMock(
-                read=MagicMock(return_value=mock_response)
-            ))
-            mock_ctx.__exit__ = MagicMock(return_value=False)
-            mock_urlopen.return_value = mock_ctx
-
-            result = _refresh_oauth_token(creds)
-
-        assert result == "new-token-abc"
-        # Verify credentials were written back
-        cred_file = tmp_path / ".claude" / ".credentials.json"
-        assert cred_file.exists()
-        written = json.loads(cred_file.read_text())
-        assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
-        assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
-
     def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_credentials.Path.home", lambda: tmp_path)
         monkeypatch.setattr(

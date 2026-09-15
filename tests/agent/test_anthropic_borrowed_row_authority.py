@@ -145,42 +145,61 @@ def test_pool_store_sync_never_adopts_a_borrowed_row(hermes_home, claude_credent
     assert synced.refresh_token == _STALE_REFRESH
 
 
-def test_refresh_from_persisted_sanitized_row_keeps_the_full_pair(
+def test_refresh_never_posts_or_writes_the_borrowed_grant(
     hermes_home, claude_credentials, monkeypatch
 ):
-    """The production ``load -> sanitize -> refresh`` path refreshes, not blanks.
+    """Only Claude Code may rotate its grant.
 
-    Exactly one POST and one authoritative write, the returned entry carries
-    the complete rotated pair, and the shared credentials file is the copy that
-    was updated.
+    Claude Code reads the pair from the macOS Keychain. A Hermes refresh spent
+    the single-use refresh token and committed the rotation to
+    ``~/.claude/.credentials.json``, which Claude Code never reads, so the CLI's
+    next refresh replayed the spent token, got ``invalid_grant`` and signed the
+    user out. An expired borrowed row is benched instead: no POST, no write.
     """
     posts = []
     writes = []
-
-    def _counting_refresh(refresh_token, **kwargs):
-        posts.append(refresh_token)
-        return _rotating_refresh(refresh_token, **kwargs)
-
-    real_write = AA._write_claude_code_credentials
-
-    def _counting_write(access_token, refresh_token, expires_at_ms):
-        writes.append(refresh_token)
-        return real_write(access_token, refresh_token, expires_at_ms)
-
-    monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _counting_refresh)
-    monkeypatch.setattr(AA, "_write_claude_code_credentials", _counting_write)
+    monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", lambda rt, **_kw: posts.append(rt))
+    monkeypatch.setattr(AA, "_write_claude_code_credentials", lambda *a, **_kw: writes.append(a))
 
     pool = load_pool("anthropic")
     entry = next(e for e in pool._entries if e.source == "claude_code")
 
+    assert pool._refresh_entry(entry, force=True) is None
+    assert posts == [], f"the borrowed refresh token was spent: {posts}"
+    assert writes == [], f"Claude Code's credentials were rewritten: {writes}"
+    assert _claude_pair(claude_credentials) == (_STALE_ACCESS, _STALE_REFRESH)
+
+
+def test_refresh_adopts_claude_codes_own_rotation(
+    hermes_home, claude_credentials, monkeypatch
+):
+    """When Claude Code has rotated the pair, the refresh adopts it without a POST."""
+    posts = []
+    monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", lambda rt, **_kw: posts.append(rt))
+
+    pool = load_pool("anthropic")
+    entry = next(e for e in pool._entries if e.source == "claude_code")
+
+    claude_credentials.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": _ROTATED_ACCESS,
+                    "refreshToken": _ROTATED_REFRESH,
+                    "expiresAt": int(time.time() * 1000) + 3_600_000,
+                    "scopes": ["user:inference", "user:profile"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
     refreshed = pool._refresh_entry(entry, force=True)
 
-    assert refreshed is not None, "the refresh must not be abandoned"
+    assert refreshed is not None
     assert refreshed.access_token == _ROTATED_ACCESS
     assert refreshed.refresh_token == _ROTATED_REFRESH
-    assert posts == [_STALE_REFRESH], f"expected exactly one POST, got {posts}"
-    assert writes == [_ROTATED_REFRESH], f"expected exactly one commit, got {writes}"
-    assert _claude_pair(claude_credentials) == (_ROTATED_ACCESS, _ROTATED_REFRESH)
+    assert posts == []
 
 
 def test_refresh_reaches_the_shared_credentials_lock(
@@ -226,20 +245,6 @@ def test_empty_oauth_entry_is_never_leased(hermes_home, claude_credentials):
         "an OAuth entry with no access token must never be leased"
     )
     assert blanked.id not in {e.id for e in available}
-
-
-def test_selection_after_refresh_leases_only_hydrated_entries(
-    hermes_home, claude_credentials, monkeypatch
-):
-    """End-to-end: refresh through selection leaves a usable, non-empty lease."""
-    monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _rotating_refresh)
-
-    pool = load_pool("anthropic")
-    available, _pending = pool._available_entries(clear_expired=True, refresh=True)
-
-    assert available, "the credential must survive the refresh, not be dropped"
-    assert all(e.access_token for e in available)
-    assert any(e.access_token == _ROTATED_ACCESS for e in available)
 
 
 def test_hermes_pkce_row_still_syncs_from_the_pool_store(monkeypatch):
