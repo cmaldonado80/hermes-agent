@@ -133,6 +133,10 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    paused: bool = False
+    """True when the global emergency stop (``hermes pause``) held this tick: nothing
+    was reclaimed or spawned. The gate sits in :func:`dispatch_once`, so the CLI, the
+    dashboard and the gateway watcher all honor it."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1415,6 +1419,17 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _estop_engaged() -> bool:
+    """True while ``hermes pause`` holds new work. Fails open if estop is unimportable,
+    matching the gateway watcher's gate."""
+    try:
+        from agent.estop import check_paused
+    except ImportError:
+        return False
+    import logging
+    return check_paused("kanban", logging.getLogger(__name__))
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1437,7 +1452,15 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    While the emergency stop is engaged a real tick returns ``paused=True`` and
+    touches nothing; a dry run spawns nothing and is still allowed.
     """
+    if not dry_run and _estop_engaged():
+        result = DispatchResult(paused=True)
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        return result
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,

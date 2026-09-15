@@ -105,7 +105,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "paused": res.paused,
         }, ascii=True)
+        return 0
+    if res.paused:
+        print("Paused:       emergency stop engaged, nothing dispatched (run `hermes resume`)")
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     for label, items in (
