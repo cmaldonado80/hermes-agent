@@ -225,3 +225,50 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# triage_stuck rule — loop-routed cards parked in triage
+# ---------------------------------------------------------------------------
+
+
+def test_triage_stuck_fires_after_threshold_and_suggests_revive():
+    now = int(time.time())
+    task = _task(id="t_triage1", status="triage")
+    events = [_event("block_loop_detected", ts=now - 3600 * 30, payload_kind="capability")]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    hits = [d for d in diags if d.kind == "triage_stuck"]
+    assert len(hits) == 1
+    d = hits[0]
+    assert d.severity == "warning"
+    assert any(a.payload.get("command") == "hermes kanban revive t_triage1"
+               for a in d.actions)
+
+
+def test_triage_stuck_clears_after_revive():
+    now = int(time.time())
+    task = _task(id="t_triage1", status="ready")
+    events = [
+        _event("block_loop_detected", ts=now - 3600 * 30, payload_kind="capability"),
+        _event("revived", ts=now - 60, from_status="triage", status="ready"),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert not [d for d in diags if d.kind == "triage_stuck"]
+
+
+def test_triage_stuck_ignores_recent_routing_and_creation_parking():
+    now = int(time.time())
+    # Routed seconds ago: below the age gate.
+    recent = kd.compute_task_diagnostics(
+        _task(status="triage"),
+        [_event("block_loop_detected", ts=now - 60, payload_kind="needs_input")],
+        [], now=now,
+    )
+    assert not [d for d in recent if d.kind == "triage_stuck"]
+    # Parked at creation (--triage): no loop event, specify/decompose own it.
+    parked = kd.compute_task_diagnostics(
+        _task(status="triage"),
+        [_event("created", ts=now - 3600 * 48)],
+        [], now=now,
+    )
+    assert not [d for d in parked if d.kind == "triage_stuck"]

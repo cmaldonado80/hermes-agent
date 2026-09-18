@@ -1815,6 +1815,12 @@ DEFAULT_CONFIG = {
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
+        # Probe the exact provider/model route before claiming a card so dead credentials,
+        # unsupported models and unreachable endpoints do not start retry spirals.
+        "dispatch_liveness_gate": True,
+        "dispatch_liveness_timeout_seconds": 8,
+        "dispatch_liveness_alive_ttl_seconds": 300,
+        "dispatch_liveness_dead_ttl_seconds": 60,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.

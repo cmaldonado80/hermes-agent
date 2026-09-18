@@ -617,6 +617,18 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_kanban_liveness_gate(request, monkeypatch):
+    """Keep unrelated dispatcher tests from making live provider requests."""
+    if request.node.get_closest_marker("real_kanban_liveness_gate"):
+        return
+    try:
+        from hermes_cli import kanban_dispatch_liveness as _liveness
+    except Exception:
+        return
+    monkeypatch.setattr(_liveness, "liveness_gate_enabled", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_git_safe_directory_read(request, monkeypatch):
     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.
 
@@ -1315,6 +1327,10 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "real_memory_guard: bypass the autouse fixture that pins the kanban "
         "dispatcher's memory guard to 'no data' — only for tests that "
         "exercise the guard itself with their own patched samples.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_kanban_liveness_gate: exercise the dispatch-time provider liveness gate.",
     )
     # NOTE: linux_only / macos_only / windows_only are declared in
     # pyproject.toml's ``markers`` list, not here — they are part of the

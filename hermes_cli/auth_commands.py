@@ -19,6 +19,7 @@ from agent.credential_pool import (
     load_pool)
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import PROVIDER_REGISTRY
+from hermes_cli.auth_check import auth_check_command
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -807,7 +808,7 @@ def auth_upgrade_command(args) -> None:
 
 
 _AUTH_ACTIONS = {
-    "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
+    "add": auth_add_command, "check": auth_check_command, "list": auth_list_command, "remove": auth_remove_command,
     "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
     "logout": auth_logout_command, "upgrade": auth_upgrade_command,
     "spotify": auth_spotify_command}

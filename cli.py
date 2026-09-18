@@ -4119,6 +4119,29 @@ _TRANSIENT_PROVIDER_REASONS = frozenset({
 })
 
 
+def _interactive_run_never_turned(cli) -> Optional[str]:
+    """Why the interactive REPL ended without a single conversation turn, or None.
+
+    Returns a short reason string ONLY for a non-interactive (piped/closed stdin)
+    run whose process never executed a turn — the shape a smoke probe uses — so
+    ``cli.main`` can exit non-zero instead of an implicit rc=0. An interactive
+    TTY session (someone opened chat and quit) returns None: exit 0 stays the
+    honest code there. ``_last_turn_result`` is the same signal the one-shot
+    exit contract reads; it is set by ``_chat_settle_turn`` for every completed
+    turn, so None reliably means "no turn ran".
+    """
+    try:
+        if sys.stdin.isatty():
+            return None
+    except Exception:
+        pass  # stdin unpollable (closed fd) — treat as non-interactive
+    if getattr(cli, "_last_turn_result", None) is not None:
+        return None  # at least one turn ran; the run said what it wanted to say
+    if not cli._tui_stdin_usable():
+        return "stdin is not usable"
+    return "stdin was not a TTY and no input arrived"
+
+
 def _single_query_exit_code(result) -> int:
     """Map a one-shot turn result onto a process exit code, for both `-q` and `-Q`.
 
@@ -4709,6 +4732,22 @@ def main(
         _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json=output_format == "stream-json")
         return
     cli.run()
+    # Honest exit for piped no-query chat: a non-TTY `hermes chat` with no -q and no
+    # stdin input reads EOF and used to fall through to an implicit rc=0 having never
+    # called the model — a smoke runner reading only the exit code saw "OK" (the
+    # 2026-09-18 dead-provider false positive). A real TTY user who opens chat and
+    # quits (/exit, Ctrl-D) never hits this: stdin is interactive, so the guard is
+    # skipped. Same contract the one-shot paths already encode via
+    # _single_query_exit_code: no turn ran => not success.
+    _exit_no_turn = _interactive_run_never_turned(cli)
+    if _exit_no_turn is not None:
+        print(
+            f"hermes: no conversation turn ran in this process "
+            f"({_exit_no_turn}); non-interactive chat requires a query "
+            f"(-q \"...\" / --query-file - / -z \"...\").",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -341,6 +341,7 @@ in one command:
 hermes kanban complete t_abc t_def t_hij --result "batch wrap"
 hermes kanban archive  t_abc t_def t_hij
 hermes kanban unblock  t_abc t_def
+hermes kanban revive   t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
@@ -362,6 +363,21 @@ survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
+:::
+
+:::note Getting a task out of `triage`
+`revive` is the exit from the `triage` column: `hermes kanban revive <id>...`
+resets the card's loop-state (`block_kind`/`block_recurrences` from the
+unblock-loop breaker, `consecutive_failures`/`last_failure_error` from the
+dispatch circuit breaker), leaves triage, and lands it in **`ready`** — or
+**`todo`** while any parent remains open, exactly like `unblock`, so a revive
+can never run a child past an unfinished parent. Every revive records a
+`revived` event with who, when, from `triage`, and the loop-state it cleared.
+Reviving a card whose model was dead is safe *after* the model is fixed: the
+dispatcher's guards were cleared with the revive, and the (separate) dispatch
+liveness gate still refuses to spawn a card whose model probe fails — fix the
+model, then revive. Cards that are not in `triage` are refused with a clear
+error; use `unblock` (blocked/scheduled) or `promote` (todo/blocked) instead.
 :::
 
 ## Enabling tools for a chat profile
@@ -915,6 +931,10 @@ All commands are also available as a slash command in the interactive CLI and in
 | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
 | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When set, this home's dispatcher only claims cards whose assignee is listed (fail-closed; an empty list claims nothing); other assignees land in `skipped_nonspawnable`. See [Shared boards across homes](#shared-boards-across-homes). |
+| `kanban.dispatch_liveness_gate` | `true` | Probes a card's pinned provider/model (or its assignee profile's default route) before claim; dead routes leave the card ready and let the tick continue. |
+| `kanban.dispatch_liveness_timeout_seconds` | `8` | Maximum seconds allowed for the dispatch-time one-token liveness request. |
+| `kanban.dispatch_liveness_alive_ttl_seconds` | `300` | How long a healthy profile/provider/model probe is reused in-process. |
+| `kanban.dispatch_liveness_dead_ttl_seconds` | `60` | How long a dead-route result is reused before checking for recovery. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 

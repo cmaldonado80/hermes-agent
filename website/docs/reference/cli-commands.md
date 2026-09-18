@@ -188,6 +188,13 @@ billing/quota wall, exits
 failure. With `--format stream-json` the terminal `result` record carries the
 same `exit_code`.
 
+A chat run with **no query** is interactive by definition. Launched without a
+TTY (piped stdin, closed fd 0), it reads EOF and exits `1` with a stderr line
+explaining that no conversation turn ran and naming `-q` / `--query-file` /
+`-z` — a smoke probe can no longer mistake a dead provider for success
+(2026-09-18). The same applies to `--tui` without a TTY. An interactive TTY
+session that runs zero turns (open chat, quit) still exits `0`.
+
 #### Delegation in finite chat runs
 
 When chat answers and exits (`-Q`, `chat --oneshot`, or a query with non-TTY
@@ -653,6 +660,8 @@ Manage credential pools for same-provider key rotation. See [Credential Pools](/
 
 ```bash
 hermes auth                                              # Interactive wizard
+hermes auth check --profile default,work --provider zai  # Diagnose de-facto credentials by profile
+hermes auth check --json                                 # Machine-readable report; never prints secret values
 hermes auth list                                         # Show all pools
 hermes auth list openrouter                              # Show specific provider
 hermes auth add openrouter --api-key sk-or-v1-xxx        # Add API key
@@ -669,7 +678,7 @@ hermes auth logout anthropic                             # Log out and clear sto
 hermes auth spotify                                      # Authenticate Hermes with Spotify via PKCE
 ```
 
-Subcommands: `add`, `list`, `remove`, `reset`, `priority`, `refresh`, `status`, `logout`, `spotify`. When called with no subcommand, launches the interactive management wizard.
+Subcommands: `add`, `check`, `list`, `remove`, `reset`, `priority`, `refresh`, `status`, `logout`, `spotify`. When called with no subcommand, launches the interactive management wizard.
 
 ## `hermes status`
 
