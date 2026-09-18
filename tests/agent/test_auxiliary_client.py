@@ -2861,7 +2861,7 @@ class TestAuxiliaryAuthRefreshRetry:
 
 
 
-    def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
+    def test_refresh_provider_credentials_never_spends_claude_code_grant(self, monkeypatch):
         stale_client = MagicMock()
         from agent.auxiliary_client import _client_cache_key
         cache_key = _client_cache_key("anthropic", async_mode=False)
@@ -2889,13 +2889,10 @@ class TestAuxiliaryAuthRefreshRetry:
         ):
             from agent.auxiliary_client import _refresh_provider_credentials
 
-            assert _refresh_provider_credentials("anthropic", failed_api_key="expired-token") is True
-            import agent.auxiliary_client as aux
-            assert cache_key not in aux._client_cache  # evicted, not closed (in-flight users)
+            assert _refresh_provider_credentials("anthropic", failed_api_key="expired-token") is False
 
-        mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
-        mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
-        stale_client.close.assert_not_called()
+        mock_refresh_oauth.assert_not_called()
+        mock_write.assert_not_called()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
         """Vertex tokens live ~1h; on a long-running gateway the cached

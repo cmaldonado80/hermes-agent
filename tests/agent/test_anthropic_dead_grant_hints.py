@@ -38,42 +38,44 @@ def test_dead_grant_is_classified_and_not_replayed_at_other_endpoints(monkeypatc
     assert not ac.is_terminal_anthropic_refresh_error(TimeoutError("timed out"))
 
 
-def test_claude_code_refresher_warns_on_dead_grant(monkeypatch, caplog):
-    """The auxiliary Claude Code refresher is a sibling path of the pool: same WARNING, same Hermes hint."""
+def test_claude_code_refresher_never_spends_the_borrowed_grant(monkeypatch, caplog):
+    """Claude Code owns its grant; the refresher must neither POST it nor warn about
+    endpoint verdicts it never asked for. It only adopts a token Claude Code already
+    refreshed, and a dead grant is reported by the pool's own quarantine path."""
     monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: {"accessToken": "old", "refreshToken": "rt", "expiresAt": 1})
 
-    def dead(refresh_token, *, use_json=False):
-        raise ac.AnthropicOAuthError(400, "invalid_grant", "", what="refresh")
+    posts: list = []
 
-    monkeypatch.setattr(ac, "refresh_anthropic_oauth_pure", dead)
-    with caplog.at_level(logging.INFO, logger=ac.logger.name):
-        assert ac._refresh_oauth_token({"accessToken": "old", "refreshToken": "rt"}) is None
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1 and "hermes auth add anthropic" in warnings[0]
-
-
-def test_claude_code_refresher_reports_dead_grant_once_per_process(monkeypatch, caplog):
-    """Later attempts with the same dead refresh token neither replay it at the endpoint nor re-warn; a rotated
-    (re-login) token is tried again."""
-    monkeypatch.setattr(ac, "_DEAD_REFRESH_TOKEN_FINGERPRINTS", set())
-    monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: {"accessToken": "old", "refreshToken": "rt-dead", "expiresAt": 1})
-    posts = []
-
-    def dead(refresh_token, *, use_json=False):
+    def must_not_post(refresh_token, *, use_json=False):
         posts.append(refresh_token)
-        raise ac.AnthropicOAuthError(400, "invalid_grant", "", what="refresh")
+        raise AssertionError("the borrowed Claude Code grant must never be POSTed")
 
-    monkeypatch.setattr(ac, "refresh_anthropic_oauth_pure", dead)
-    creds = {"accessToken": "old", "refreshToken": "rt-dead"}
+    monkeypatch.setattr(ac, "refresh_anthropic_oauth_pure", must_not_post)
     with caplog.at_level(logging.DEBUG, logger=ac.logger.name):
-        for _ in range(3):
-            assert ac._refresh_oauth_token(creds) is None
-    assert posts == ["rt-dead"]
-    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+        assert ac._refresh_oauth_token({"accessToken": "old", "refreshToken": "rt"}) is None
+    assert posts == []
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
     assert not any("claude setup-token" in r.getMessage() for r in caplog.records)
-    monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: {"accessToken": "old", "refreshToken": "rt-new", "expiresAt": 1})
-    assert ac._refresh_oauth_token({"accessToken": "old", "refreshToken": "rt-new"}) is None
-    assert posts == ["rt-dead", "rt-new"]
+
+
+def test_claude_code_refresher_adopts_only_a_real_future_rotation(monkeypatch, caplog):
+    """A DIFFERENT token with a real future expiry is adopted; a re-read that still shows
+    the same expired token (Claude Code has not refreshed yet) is left for Claude Code's
+    next run — never spent by Hermes."""
+    monkeypatch.setattr(ac, "_DEAD_REFRESH_TOKEN_FINGERPRINTS", set())
+    monkeypatch.setattr(ac, "refresh_anthropic_oauth_pure",
+                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not POST")))
+    creds = {"accessToken": "old", "refreshToken": "rt-dead", "expiresAt": 1}
+    monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: creds)
+    with caplog.at_level(logging.DEBUG, logger=ac.logger.name):
+        assert ac._refresh_oauth_token(creds) is None  # same expired token: nothing to adopt
+    rotated = {"accessToken": "new", "refreshToken": "rt-new", "expiresAt": 4102444800000}
+    monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: rotated)
+    assert ac._refresh_oauth_token(creds) == "new"  # Claude Code rotated: adopt
+    # A re-read that is valid but NOT a different token (managed key / unknown expiry) is not adopted.
+    same_but_valid = {"accessToken": "old", "expiresAt": 4102444800000}
+    monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: same_but_valid)
+    assert ac._refresh_oauth_token(creds) is None
 
 
 def test_claude_code_credentials_path_honours_claude_config_dir(monkeypatch, tmp_path):
