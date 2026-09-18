@@ -21,7 +21,9 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
         with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:
-            fh.write("{}\n")  # identity marker: a bare dir is not a profile
+            fh.write("kanban:\n  dispatch_liveness_gate: false\n")
+    with open(os.path.join(test_home, "config.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("kanban:\n  dispatch_liveness_gate: false\n")
     monkeypatch.setenv("HERMES_HOME", test_home)
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
@@ -102,5 +104,3 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert len(res2.spawned) == 1
     assert len(res2.skipped_per_profile_capped) == 1
     assert res2.spawned[0][0] != spawned_id  # different task this time
-
-

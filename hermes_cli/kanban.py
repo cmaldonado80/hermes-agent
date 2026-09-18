@@ -216,7 +216,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "revive",
     "gc",
 })
 
@@ -967,6 +967,36 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_revive(args: argparse.Namespace) -> int:
+    """Triage exit: reset loop-state, leave triage, re-gate on parents."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban revive is orchestrator-only; workers must hand off their assigned task")
+    ids, rc = _require_ids(args)
+    if rc:
+        return rc
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    if reason is not None:
+        reason = str(kb.redact_review_value(reason)).strip() or None
+    actor = _profile_author()
+    suffix = f": {reason}" if reason else ""
+    with kbc.connect_closing() as conn:
+        def ok_msg(tid):
+            landed = kb.get_task(conn, tid)
+            where = landed.status if landed else "ready"
+            gate = "" if where == "ready" else " (todo — parent gates still open)"
+            return f"Revived {tid} → {where}{gate}{suffix}"
+
+        failed = False
+        for tid in ids:
+            ok, err = kb.revive_task(conn, tid, actor=actor, reason=reason)
+            if ok:
+                print(ok_msg(tid))
+            else:
+                failed = True
+                print(f"cannot revive {tid}: {err or 'not in triage?'}", file=sys.stderr)
+        return 1 if failed else 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1262,7 +1292,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "revive": _cmd_revive,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
@@ -1290,6 +1320,7 @@ Common subcommands:
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `revive <id>…`         Take triage tasks out of triage (loop-detector exit; re-gates parents)
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

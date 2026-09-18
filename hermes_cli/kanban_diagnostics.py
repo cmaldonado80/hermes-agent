@@ -621,6 +621,53 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _rule_triage_stuck(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A card sitting in ``triage`` with no revive since the latest
+    ``block_loop_detected`` — the machine parking column has an exit
+    (``hermes kanban revive``); surface it instead of letting operators
+    hand-copy a successor card. Age-gated by ``triage_stale_hours``
+    (default 24h) so a card routed seconds ago doesn't nag."""
+    if _task_field(task, "status") != "triage":
+        return []
+    latest_loop = next(
+        (ev for ev in reversed(list(events)) if _event_kind(ev) == "block_loop_detected"),
+        None,
+    )
+    if latest_loop is None:
+        # Parked at creation (--triage), not loop-routed: specify/decompose own it.
+        return []
+    revived_after = any(
+        _event_kind(ev) == "revived" and _event_ts(ev) >= _event_ts(latest_loop)
+        for ev in events
+    )
+    if revived_after:
+        return []
+
+    hours = float(cfg.get("triage_stale_hours", 24))
+    routed_at = _event_ts(latest_loop)
+    age_seconds = max(0, int(now) - routed_at)
+    if age_seconds < hours * 3600:
+        return []
+
+    task_id = _task_field(task, "id") or "<task_id>"
+    cmd = f"hermes kanban revive {task_id}"
+    actions = [
+        _cli_hint(f"Revive out of triage: {cmd}", cmd, suggested=True),
+        _cli_hint("Check block reasons first", f"hermes kanban show {task_id}"),
+    ]
+    return [Diagnostic(
+        kind="triage_stuck", severity="warning",
+        title=f"Task routed to triage {int(age_seconds / 3600)}h ago and still parked",
+        detail="The unblock-loop breaker routed this task to triage and it has not left since. "
+               "If the root cause (unfinished parent, missing input, dead model) is fixed, "
+               "revive it back into the work pool; otherwise a successor card just duplicates "
+               "the knowledge already on this one.",
+        actions=actions,
+        first_seen_at=routed_at, last_seen_at=int(now), count=1,
+        data={"task_id": task_id, "age_seconds": age_seconds, "routed_at": routed_at},
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
     (default 30 min). Deliberately age-based and identity-agnostic so it
@@ -688,6 +735,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_triage_stuck,
     _rule_stranded_in_ready,
 ]
 
@@ -703,6 +751,9 @@ DEFAULT_CONFIG = {
     # Below 30 min the signal is dominated by tasks about to be claimed on
     # the next dispatcher tick.
     "stranded_threshold_seconds": 30 * 60,
+    # triage_stuck: how long a loop-routed card may sit in triage before the
+    # diagnostic nudges the operator toward `hermes kanban revive`.
+    "triage_stale_hours": 24,
 }
 
 
@@ -789,6 +840,7 @@ DIAGNOSTIC_KINDS = (
     "review_dependency_deadlock",
     "stuck_in_blocked",
     "block_unblock_cycling",
+    "triage_stuck",
     "stranded_in_ready",
 )
 # ---- END PLUGIN-COMPAT ----

@@ -1,0 +1,241 @@
+diff --git a/cli.py b/cli.py
+index 04da990663..1ab4d495a6 100644
+--- a/cli.py
++++ b/cli.py
+@@ -4119,6 +4119,29 @@ _TRANSIENT_PROVIDER_REASONS = frozenset({
+ })
+ 
+ 
++def _interactive_run_never_turned(cli) -> Optional[str]:
++    """Why the interactive REPL ended without a single conversation turn, or None.
++
++    Returns a short reason string ONLY for a non-interactive (piped/closed stdin)
++    run whose process never executed a turn — the shape a smoke probe uses — so
++    ``cli.main`` can exit non-zero instead of an implicit rc=0. An interactive
++    TTY session (someone opened chat and quit) returns None: exit 0 stays the
++    honest code there. ``_last_turn_result`` is the same signal the one-shot
++    exit contract reads; it is set by ``_chat_settle_turn`` for every completed
++    turn, so None reliably means "no turn ran".
++    """
++    try:
++        if sys.stdin.isatty():
++            return None
++    except Exception:
++        pass  # stdin unpollable (closed fd) — treat as non-interactive
++    if getattr(cli, "_last_turn_result", None) is not None:
++        return None  # at least one turn ran; the run said what it wanted to say
++    if not cli._tui_stdin_usable():
++        return "stdin is not usable"
++    return "stdin was not a TTY and no input arrived"
++
++
+ def _single_query_exit_code(result) -> int:
+     """Map a one-shot turn result onto a process exit code, for both `-q` and `-Q`.
+ 
+@@ -4709,6 +4732,22 @@ def main(
+         _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json=output_format == "stream-json")
+         return
+     cli.run()
++    # Honest exit for piped no-query chat: a non-TTY `hermes chat` with no -q and no
++    # stdin input reads EOF and used to fall through to an implicit rc=0 having never
++    # called the model — a smoke runner reading only the exit code saw "OK" (the
++    # 2026-09-18 dead-provider false positive). A real TTY user who opens chat and
++    # quits (/exit, Ctrl-D) never hits this: stdin is interactive, so the guard is
++    # skipped. Same contract the one-shot paths already encode via
++    # _single_query_exit_code: no turn ran => not success.
++    _exit_no_turn = _interactive_run_never_turned(cli)
++    if _exit_no_turn is not None:
++        print(
++            f"hermes: no conversation turn ran in this process "
++            f"({_exit_no_turn}); non-interactive chat requires a query "
++            f"(-q \"...\" / --query-file - / -z \"...\").",
++            file=sys.stderr,
++        )
++        sys.exit(1)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/hermes_cli/test_interactive_no_turn_exit.py b/tests/hermes_cli/test_interactive_no_turn_exit.py
+new file mode 100644
+index 0000000000..4c999cae18
+--- /dev/null
++++ b/tests/hermes_cli/test_interactive_no_turn_exit.py
+@@ -0,0 +1,104 @@
++"""Honest exit codes for no-query smoke runs (2026-09-18 incident).
++
++A piped ``hermes chat`` with no ``-q``/``--query-file`` used to boot the REPL,
++read EOF, print "Goodbye" and exit 0 having never called the model — a smoke
++runner reading only the exit code saw "OK" against a dead provider and a full
++QA card was wasted. The interactive REPL now exits ``1`` with a clear stderr
++line when its stdin was never a TTY and no conversation turn ran in the
++process; a real TTY session that runs zero or more turns keeps exit 0, and a
++piped run whose turn DID run keeps the one-shot contract (tested in
++test_single_query_exit_contract.py / test_oneshot_exit_contract.py).
++"""
++
++from types import SimpleNamespace
++
++import pytest
++
++import cli
++
++
++class _FakeStdin:
++    def __init__(self, isatty: bool):
++        self._isatty = isatty
++
++    def isatty(self) -> bool:
++        return self._isatty
++
++
++def _fake_cli(ran_turn: bool, stdin_usable: bool = True):
++    return SimpleNamespace(
++        _last_turn_result=({"final_response": "hi", "completed": True} if ran_turn else None),
++        _tui_stdin_usable=lambda: stdin_usable,
++    )
++
++
++def test_piped_repl_that_never_ran_a_turn_reports_why(monkeypatch):
++    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(isatty=False))
++    reason = cli._interactive_run_never_turned(_fake_cli(ran_turn=False))
++    assert reason == "stdin was not a TTY and no input arrived"
++
++
++def test_piped_repl_with_unusable_stdin_reports_why(monkeypatch):
++    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(isatty=False))
++    reason = cli._interactive_run_never_turned(_fake_cli(ran_turn=False, stdin_usable=False))
++    assert reason == "stdin is not usable"
++
++
++def test_tty_session_without_a_turn_still_exits_clean(monkeypatch):
++    """Someone opened chat on a real terminal and quit — exit 0 stays honest."""
++    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(isatty=True))
++    assert cli._interactive_run_never_turned(_fake_cli(ran_turn=False)) is None
++
++
++def test_piped_repl_whose_turn_ran_still_exits_clean(monkeypatch):
++    """Non-TTY but a turn executed: the one-shot exit contract owns the code."""
++    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(isatty=False))
++    assert cli._interactive_run_never_turned(_fake_cli(ran_turn=True)) is None
++
++
++def test_unpollable_stdin_is_treated_as_non_interactive(monkeypatch):
++    class _BrokenStdin:
++        def isatty(self):
++            raise OSError("fd 0 closed")
++
++    monkeypatch.setattr(cli.sys, "stdin", _BrokenStdin())
++    reason = cli._interactive_run_never_turned(_fake_cli(ran_turn=False))
++    assert reason is not None
++
++
++def test_main_after_run_exits_one_when_piped_and_turnless(monkeypatch, capsys):
++    """End-to-end: ``cli.main`` with no query, piped stdin, and a ``run()`` that
++    never turned must raise SystemExit(1) and print the guidance to stderr."""
++
++    class _PipedCli(SimpleNamespace):
++        def run(self):
++            return None
++
++    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(isatty=False))
++    monkeypatch.setattr(cli, "HermesCLI", lambda **_kwargs: _PipedCli(
++        _last_turn_result=None, _tui_stdin_usable=lambda: True))
++    monkeypatch.setattr(cli.atexit, "register", lambda *_a, **_k: None)
++    monkeypatch.setattr(cli, "_install_single_query_signal_handlers", lambda _cli: None)
++
++    with pytest.raises(SystemExit) as exc_info:
++        cli.main(toolsets="terminal")
++
++    assert exc_info.value.code == 1
++    stderr = capsys.readouterr().err
++    assert "no conversation turn ran" in stderr
++    assert "-q" in stderr  # the fix command is named
++
++
++def test_main_after_run_exits_zero_on_tty_without_a_turn(monkeypatch):
++    class _TtyCli(SimpleNamespace):
++        def run(self):
++            return None
++
++    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin(isatty=True))
++    monkeypatch.setattr(cli, "HermesCLI", lambda **_kwargs: _TtyCli(
++        _last_turn_result=None, _tui_stdin_usable=lambda: True))
++    monkeypatch.setattr(cli.atexit, "register", lambda *_a, **_k: None)
++    monkeypatch.setattr(cli, "_install_single_query_signal_handlers", lambda _cli: None)
++
++    # No SystemExit: falls off the end of main() = implicit exit 0.
++    assert cli.main(toolsets="terminal") is None
+diff --git a/ui-tui/src/__tests__/noTtyExitCode.test.ts b/ui-tui/src/__tests__/noTtyExitCode.test.ts
+new file mode 100644
+index 0000000000..dc327be81f
+--- /dev/null
++++ b/ui-tui/src/__tests__/noTtyExitCode.test.ts
+@@ -0,0 +1,33 @@
++import { readFileSync } from 'node:fs'
++import { dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++import { describe, expect, it } from 'vitest'
++
++/**
++ * Honest exit codes for no-TTY smoke runs (2026-09-18 incident).
++ *
++ * `hermes chat --tui` on a pipe reached entry.tsx with stdin.isTTY === false
++ * and exited 0 before any model turn ran; `_launch_tui` propagates that code,
++ * so a smoke runner saw "OK" against a dead provider. The bail-out must exit
++ * non-zero. Asserting on the source (not spawning the TUI) matches the
++ * bundle-shape test precedent and keeps the test TTY-free.
++ */
++
++const entrySource = readFileSync(
++  join(dirname(fileURLToPath(import.meta.url)), '..', 'entry.tsx'),
++  'utf8',
++)
++
++const noTtyBlock = /if \(!process\.stdin\.isTTY\) \{[\s\S]*?\}/.exec(entrySource)
++
++describe('no-TTY bail-out exits non-zero', () => {
++  it('has the guard at module top (before the gateway client starts)', () => {
++    expect(noTtyBlock).not.toBeNull()
++  })
++
++  it('exits 1, not 0', () => {
++    expect(noTtyBlock![0]).toContain('process.exit(1)')
++    expect(noTtyBlock![0]).not.toContain('process.exit(0)')
++  })
++})
+diff --git a/ui-tui/src/entry.tsx b/ui-tui/src/entry.tsx
+index 79bc67daf5..667ed43e4b 100644
+--- a/ui-tui/src/entry.tsx
++++ b/ui-tui/src/entry.tsx
+@@ -16,8 +16,11 @@ import { recordParentLifecycle } from './lib/parentLog.js'
+ import { resetTerminalModes } from './lib/terminalModes.js'
+ 
+ if (!process.stdin.isTTY) {
++  // Exit non-zero: `_launch_tui` propagates this code, and a 0 here made a piped
++  // `hermes chat --tui` (no query) look like a successful smoke run even though
++  // no model turn ever ran (2026-09-18 dead-provider false positive).
+   console.log('hermes-tui: no TTY')
+-  process.exit(0)
++  process.exit(1)
+ }
+ 
+ // Start from a clean slate. If a previous TUI crashed or was kill -9'd, the
+diff --git a/website/docs/reference/cli-commands.md b/website/docs/reference/cli-commands.md
+index 381bf81fd8..51b43d5b8d 100644
+--- a/website/docs/reference/cli-commands.md
++++ b/website/docs/reference/cli-commands.md
+@@ -188,6 +188,13 @@ billing/quota wall, exits
+ failure. With `--format stream-json` the terminal `result` record carries the
+ same `exit_code`.
+ 
++A chat run with **no query** is interactive by definition. Launched without a
++TTY (piped stdin, closed fd 0), it reads EOF and exits `1` with a stderr line
++explaining that no conversation turn ran and naming `-q` / `--query-file` /
++`-z` — a smoke probe can no longer mistake a dead provider for success
++(2026-09-18). The same applies to `--tui` without a TTY. An interactive TTY
++session that runs zero turns (open chat, quit) still exits `0`.
++
+ #### Delegation in finite chat runs
+ 
+ When chat answers and exits (`-Q`, `chat --oneshot`, or a query with non-TTY

@@ -1,0 +1,616 @@
+diff --git a/cron/AGENTS.md b/cron/AGENTS.md
+index ec38f3dcdb..2299c0e813 100644
+--- a/cron/AGENTS.md
++++ b/cron/AGENTS.md
+@@ -57,7 +57,7 @@ zero outside a kanban task (footprint ladder rung 3).
+ - **CLI:** `hermes_cli/kanban.py` facade + 14 `kanban_*.py` siblings (`boards`, `db`, `db_connect`,
+   `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
+   unlink, comment, attach, attachments, attach-rm, complete, request-review, request-changes,
+-  reopen-review, block, unblock, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
++  reopen-review, block, unblock, revive, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
+   notify-*, dispatch, daemon, gc`. Argparse alias dispatch must accept both `list` and `ls` (root).
+ - **Toolset:** `tools/kanban_tools.py` — `kanban_show, kanban_complete, kanban_request_review,
+   kanban_request_changes, kanban_block, kanban_heartbeat, kanban_comment, kanban_create, kanban_link,
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index f159519ed4..f896807970 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -31,7 +31,7 @@ def _kbn():
+ # "status" covers dashboard drag-drop and `_set_status_direct()`.
+ # ``review_requested`` wakes the origin like a block but is not one;
+ # the task is not archived so later review cycles keep notifying.
+-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
++TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "revived")
+ # Kinds that hand a decision back to the origin, which must take a turn.
+ # status/archived/unblocked are bookkeeping.
+ _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+@@ -416,7 +416,7 @@ def _fmt_timed_out(ev, n) -> tuple:
+     return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
+ 
+ 
+-# archived / unblocked are claimed (so the cursor advances past them) but
++# archived / unblocked / revived are claimed (so the cursor advances past them) but
+ # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
+ # never wake the creator.
+ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 8361a74a37..0c8b4e6452 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -216,7 +216,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+-    "request-review", "request-changes", "reopen-review",
++    "request-review", "request-changes", "reopen-review", "revive",
+     "gc",
+ })
+ 
+@@ -967,6 +967,36 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
+                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+ 
+ 
++def _cmd_revive(args: argparse.Namespace) -> int:
++    """Triage exit: reset loop-state, leave triage, re-gate on parents."""
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        return _err("kanban revive is orchestrator-only; workers must hand off their assigned task")
++    ids, rc = _require_ids(args)
++    if rc:
++        return rc
++    reason = _stripped_or_none(getattr(args, "reason", None))
++    if reason is not None:
++        reason = str(kb.redact_review_value(reason)).strip() or None
++    actor = _profile_author()
++    suffix = f": {reason}" if reason else ""
++    with kbc.connect_closing() as conn:
++        def ok_msg(tid):
++            landed = kb.get_task(conn, tid)
++            where = landed.status if landed else "ready"
++            gate = "" if where == "ready" else " (todo — parent gates still open)"
++            return f"Revived {tid} → {where}{gate}{suffix}"
++
++        failed = False
++        for tid in ids:
++            ok, err = kb.revive_task(conn, tid, actor=actor, reason=reason)
++            if ok:
++                print(ok_msg(tid))
++            else:
++                failed = True
++                print(f"cannot revive {tid}: {err or 'not in triage?'}", file=sys.stderr)
++        return 1 if failed else 0
++
++
+ def _cmd_request_review(args: argparse.Namespace) -> int:
+     tid = args.task_id
+     summary = _stripped_or_none(getattr(args, "summary", None))
+@@ -1262,7 +1292,7 @@ _HANDLERS = {
+     "comment": _cmd_comment, "attach": _cmd_attach,
+     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
+     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
+-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
++    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "revive": _cmd_revive,
+     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+@@ -1290,6 +1320,7 @@ Common subcommands:
+   `complete <id>…`      Mark task(s) done
+   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
+   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
++  `revive <id>…`         Take triage tasks out of triage (loop-detector exit; re-gates parents)
+   `assign <id> <profile>`  Reassign
+   `boards list`         Show all boards
+   `assignees`           Known profiles + counts
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 03d7b1f271..d815906e4f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3669,6 +3669,83 @@ def specify_triage_task(
+     return True
+ 
+ 
++def revive_task(
++    conn: sqlite3.Connection, task_id: str, *,
++    actor: Optional[str] = None, reason: Optional[str] = None,
++) -> tuple[bool, Optional[str]]:
++    """``triage`` -> ``ready`` (or ``todo`` while a parent is unfinished): the
++    exit from the loop-detector / respawn-guard parking column.
++
++    ``triage`` is reachable from two machine paths — the unblock-loop breaker
++    (:func:`block_task` at ``BLOCK_RECURRENCE_LIMIT`) and cards parked there at
++    creation — but neither ``promote`` (todo/blocked only), ``claim``, nor
++    ``unblock`` (blocked/scheduled only) accepts it, so the only exit used to
++    be a successor card. Revive is that exit: it clears the loop-state the
++    guards key on — ``block_kind``/``block_recurrences`` (same-cause re-block
++    memory), ``consecutive_failures``/``last_failure_error`` (the circuit
++    breaker + ``respawn_guarded`` inputs) — and re-gates on parents exactly
++    like :func:`unblock_task` (``_landing_status_after_parents``), so it can
++    never promote a child past an unfinished parent.
++
++    Deliberately NOT an override for the dependency itself: an unsatisfied
++    parent lands the card in ``todo`` for :func:`recompute_ready`, mirroring
++    ``promote``'s refusal semantics without needing one.
++
++    Any status other than ``triage`` is an intentional no-op returning
++    ``(False, "<status>: only triage tasks can be revived")`` — the same
++    fail-closed shape as ``promote``/``unblock``.
++    """
++    cur_status = _task_status(conn, task_id)
++    if cur_status is None:
++        return False, f"task {task_id} not found"
++    if cur_status != "triage":
++        return False, (
++            f"task {task_id} is {cur_status!r}: only triage tasks can be revived"
++        )
++
++    now = int(time.time())
++    with write_txn(conn):
++        # Re-read under the txn: the status may have moved since the check above.
++        row = conn.execute(
++            "SELECT status, block_kind, block_recurrences, consecutive_failures, assignee "
++            "FROM tasks WHERE id = ?", (task_id,),
++        ).fetchone()
++        if row is None or row["status"] != "triage":
++            return False, f"task {task_id} is no longer in triage"
++
++        landing_status = _landing_status_after_parents(conn, task_id)
++        cur = conn.execute(
++            "UPDATE tasks SET "
++            "    status = ?, current_run_id = NULL, "
++            "    claim_lock = NULL, claim_expires = NULL, "
++            "    worker_pid = NULL, worker_started_at = NULL, "
++            "    block_kind = NULL, block_recurrences = 0, "
++            "    consecutive_failures = 0, last_failure_error = NULL "
++            "WHERE id = ? AND status = 'triage'",
++            (landing_status, task_id),
++        )
++        if cur.rowcount != 1:
++            return False, f"task {task_id} status changed during revive"
++
++        # Audit trail: who, when, from where — plus the loop-state snapshot the
++        # revive cleared, so the operator can still see what triage had caught.
++        _append_event(
++            conn, task_id, "revived",
++            {
++                "from_status": "triage",
++                "status": landing_status,
++                "actor": actor,
++                "reason": reason,
++                "cleared": {
++                    "block_kind": row["block_kind"],
++                    "block_recurrences": int(row["block_recurrences"] or 0),
++                    "consecutive_failures": int(row["consecutive_failures"] or 0),
++                },
++            },
++        )
++    return True, None
++
++
+ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+     """Archive a task; a *running* task's host-local worker is terminated.
+ 
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 38ec59b440..51188159bb 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -621,6 +621,53 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
+     )]
+ 
+ 
++def _rule_triage_stuck(task, events, runs, now, cfg) -> list[Diagnostic]:
++    """A card sitting in ``triage`` with no revive since the latest
++    ``block_loop_detected`` — the machine parking column has an exit
++    (``hermes kanban revive``); surface it instead of letting operators
++    hand-copy a successor card. Age-gated by ``triage_stale_hours``
++    (default 24h) so a card routed seconds ago doesn't nag."""
++    if _task_field(task, "status") != "triage":
++        return []
++    latest_loop = next(
++        (ev for ev in reversed(list(events)) if _event_kind(ev) == "block_loop_detected"),
++        None,
++    )
++    if latest_loop is None:
++        # Parked at creation (--triage), not loop-routed: specify/decompose own it.
++        return []
++    revived_after = any(
++        _event_kind(ev) == "revived" and _event_ts(ev) >= _event_ts(latest_loop)
++        for ev in events
++    )
++    if revived_after:
++        return []
++
++    hours = float(cfg.get("triage_stale_hours", 24))
++    routed_at = _event_ts(latest_loop)
++    age_seconds = max(0, int(now) - routed_at)
++    if age_seconds < hours * 3600:
++        return []
++
++    task_id = _task_field(task, "id") or "<task_id>"
++    cmd = f"hermes kanban revive {task_id}"
++    actions = [
++        _cli_hint(f"Revive out of triage: {cmd}", cmd, suggested=True),
++        _cli_hint("Check block reasons first", f"hermes kanban show {task_id}"),
++    ]
++    return [Diagnostic(
++        kind="triage_stuck", severity="warning",
++        title=f"Task routed to triage {int(age_seconds / 3600)}h ago and still parked",
++        detail="The unblock-loop breaker routed this task to triage and it has not left since. "
++               "If the root cause (unfinished parent, missing input, dead model) is fixed, "
++               "revive it back into the work pool; otherwise a successor card just duplicates "
++               "the knowledge already on this one.",
++        actions=actions,
++        first_seen_at=routed_at, last_seen_at=int(now), count=1,
++        data={"task_id": task_id, "age_seconds": age_seconds, "routed_at": routed_at},
++    )]
++
++
+ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
+     (default 30 min). Deliberately age-based and identity-agnostic so it
+@@ -688,6 +735,7 @@ _RULES: list[RuleFn] = [
+     _rule_review_dependency_deadlock,
+     _rule_stuck_in_blocked,
+     _rule_block_unblock_cycling,
++    _rule_triage_stuck,
+     _rule_stranded_in_ready,
+ ]
+ 
+@@ -703,6 +751,9 @@ DEFAULT_CONFIG = {
+     # Below 30 min the signal is dominated by tasks about to be claimed on
+     # the next dispatcher tick.
+     "stranded_threshold_seconds": 30 * 60,
++    # triage_stuck: how long a loop-routed card may sit in triage before the
++    # diagnostic nudges the operator toward `hermes kanban revive`.
++    "triage_stale_hours": 24,
+ }
+ 
+ 
+@@ -789,6 +840,7 @@ DIAGNOSTIC_KINDS = (
+     "review_dependency_deadlock",
+     "stuck_in_blocked",
+     "block_unblock_cycling",
++    "triage_stuck",
+     "stranded_in_ready",
+ )
+ # ---- END PLUGIN-COMPAT ----
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 9c17b1f0f2..92e13a4473 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -313,6 +313,10 @@ _SPECS = [
+         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+         _TASK_IDS,
+     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
++    _cmd("revive", [
++        _TASK_IDS,
++        _reason("Optional reason/note — recorded on the revived event's audit trail."),
++    ], help="Take one or more triage tasks out of triage (resets loop-state, re-gates parents)"),
+     _cmd("request-review", [
+         _TASK_ID,
+         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
+diff --git a/tests/hermes_cli/test_kanban_diagnostics.py b/tests/hermes_cli/test_kanban_diagnostics.py
+index af9fc1696b..f1e42a0bed 100644
+--- a/tests/hermes_cli/test_kanban_diagnostics.py
++++ b/tests/hermes_cli/test_kanban_diagnostics.py
+@@ -225,3 +225,50 @@ def test_severity_at_or_above_uses_threshold_semantics():
+     assert kd.severity_at_or_above("error", "critical") is False
+     assert kd.severity_at_or_above("mystery", "warning") is False
+     assert kd.severity_at_or_above("warning", None) is True
++
++
++# ---------------------------------------------------------------------------
++# triage_stuck rule — loop-routed cards parked in triage
++# ---------------------------------------------------------------------------
++
++
++def test_triage_stuck_fires_after_threshold_and_suggests_revive():
++    now = int(time.time())
++    task = _task(id="t_triage1", status="triage")
++    events = [_event("block_loop_detected", ts=now - 3600 * 30, payload_kind="capability")]
++    diags = kd.compute_task_diagnostics(task, events, [], now=now)
++    hits = [d for d in diags if d.kind == "triage_stuck"]
++    assert len(hits) == 1
++    d = hits[0]
++    assert d.severity == "warning"
++    assert any(a.payload.get("command") == "hermes kanban revive t_triage1"
++               for a in d.actions)
++
++
++def test_triage_stuck_clears_after_revive():
++    now = int(time.time())
++    task = _task(id="t_triage1", status="ready")
++    events = [
++        _event("block_loop_detected", ts=now - 3600 * 30, payload_kind="capability"),
++        _event("revived", ts=now - 60, from_status="triage", status="ready"),
++    ]
++    diags = kd.compute_task_diagnostics(task, events, [], now=now)
++    assert not [d for d in diags if d.kind == "triage_stuck"]
++
++
++def test_triage_stuck_ignores_recent_routing_and_creation_parking():
++    now = int(time.time())
++    # Routed seconds ago: below the age gate.
++    recent = kd.compute_task_diagnostics(
++        _task(status="triage"),
++        [_event("block_loop_detected", ts=now - 60, payload_kind="needs_input")],
++        [], now=now,
++    )
++    assert not [d for d in recent if d.kind == "triage_stuck"]
++    # Parked at creation (--triage): no loop event, specify/decompose own it.
++    parked = kd.compute_task_diagnostics(
++        _task(status="triage"),
++        [_event("created", ts=now - 3600 * 48)],
++        [], now=now,
++    )
++    assert not [d for d in parked if d.kind == "triage_stuck"]
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 203a194dda..8625f57e33 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -341,6 +341,7 @@ in one command:
+ hermes kanban complete t_abc t_def t_hij --result "batch wrap"
+ hermes kanban archive  t_abc t_def t_hij
+ hermes kanban unblock  t_abc t_def
++hermes kanban revive   t_abc t_def
+ hermes kanban block    t_abc "need input" --ids t_def t_hij
+ ```
+ 
+@@ -364,6 +365,21 @@ parent, missing input, unmet capability) before unblocking, or raise
+ `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
+ :::
+ 
++:::note Getting a task out of `triage`
++`revive` is the exit from the `triage` column: `hermes kanban revive <id>...`
++resets the card's loop-state (`block_kind`/`block_recurrences` from the
++unblock-loop breaker, `consecutive_failures`/`last_failure_error` from the
++dispatch circuit breaker), leaves triage, and lands it in **`ready`** — or
++**`todo`** while any parent remains open, exactly like `unblock`, so a revive
++can never run a child past an unfinished parent. Every revive records a
++`revived` event with who, when, from `triage`, and the loop-state it cleared.
++Reviving a card whose model was dead is safe *after* the model is fixed: the
++dispatcher's guards were cleared with the revive, and the (separate) dispatch
++liveness gate still refuses to spawn a card whose model probe fails — fix the
++model, then revive. Cards that are not in `triage` are refused with a clear
++error; use `unblock` (blocked/scheduled) or `promote` (todo/blocked) instead.
++:::
++
+ ## Enabling tools for a chat profile
+ 
+ The Desktop Kanban plugin displays the board; it does not grant the chat agent
+diff --git a/tests/hermes_cli/test_kanban_revive_db.py b/tests/hermes_cli/test_kanban_revive_db.py
+new file mode 100644
+index 0000000000..68196f83f4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_revive_db.py
+@@ -0,0 +1,147 @@
++"""Tests for kb.revive_task — the triage exit (loop-detector / respawn-guard
++reset). LLM-free by design; covers the full triage → revive → ready cycle,
++the non-triage refusal, parent re-gating, and loop-state clearing."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    """Isolated HERMES_HOME with an empty kanban DB."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return home
++
++
++def _triage_via_loop_breaker(conn, title="looped"):
++    """Drive a real card through the unblock-loop breaker into ``triage``.
++
++    Mirrors test_kanban_block_kinds: block → unblock → re-block for the same
++    cause routes the card to triage at BLOCK_RECURRENCE_LIMIT with a
++    ``block_loop_detected`` event.
++    """
++    tid = kb.create_task(conn, title=title, assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    kb.block_task(conn, tid, reason="x", kind="capability")
++    assert kb.unblock_task(conn, tid)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    kb.block_task(conn, tid, reason="x", kind="capability")
++    assert kb.get_task(conn, tid).status == "triage"
++    return tid
++
++
++def test_loop_breaker_then_revive_lands_ready(kanban_home):
++    """Fixture provenance: a genuine loop-detector triage card revives to ready."""
++    with kbc.connect_closing() as conn:
++        tid = _triage_via_loop_breaker(conn)
++        ok, err = kb.revive_task(conn, tid, actor="operator", reason="fixed the model")
++        assert (ok, err) == (True, None)
++        task = kb.get_task(conn, tid)
++    assert task.status == "ready"
++    assert task.block_kind is None
++    assert int(task.block_recurrences or 0) == 0
++    assert int(task.consecutive_failures or 0) == 0
++
++
++def test_revive_records_event_with_provenance(kanban_home):
++    """The revived event carries who/when/from-where plus the cleared loop-state."""
++    with kbc.connect_closing() as conn:
++        tid = _triage_via_loop_breaker(conn)
++        before = [e.kind for e in kb.list_events(conn, tid)]
++        assert "block_loop_detected" in before
++        kb.revive_task(conn, tid, actor="alice", reason="model fixed")
++        events = kb.list_events(conn, tid)
++    revived = [e for e in events if e.kind == "revived"]
++    assert len(revived) == 1
++    payload = revived[0].payload or {}
++    assert payload["from_status"] == "triage"
++    assert payload["status"] == "ready"
++    assert payload["actor"] == "alice"
++    assert payload["reason"] == "model fixed"
++    # The audit snapshot preserves what triage had caught (breaker state).
++    assert payload["cleared"]["block_kind"] == "capability"
++    assert payload["cleared"]["block_recurrences"] >= kb.BLOCK_RECURRENCE_LIMIT
++
++
++def test_revive_rejects_non_triage_statuses(kanban_home):
++    """Normal-state cards reject revive with a clear error, and nothing changes."""
++    with kbc.connect_closing() as conn:
++        ready_tid = kb.create_task(conn, title="ready card", assignee="w")
++        ok, err = kb.revive_task(conn, ready_tid, actor="op")
++        assert ok is False
++        assert "ready" in (err or "")
++        assert "triage" in (err or "")
++        assert kb.get_task(conn, ready_tid).status == "ready"
++        # Unknown id is also a clear refusal, not an exception.
++        ok2, err2 = kb.revive_task(conn, "t_missing0")
++        assert ok2 is False
++        assert "not found" in (err2 or "")
++        # A done card refuses too (revive must not resurrect completed work).
++        done_tid = kb.create_task(conn, title="done card", assignee="w")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (done_tid,))
++        kb.claim_task(conn, done_tid, claimer="w")
++        kb.complete_task(conn, done_tid, result="done")
++        ok3, err3 = kb.revive_task(conn, done_tid)
++        assert ok3 is False
++        assert "done" in (err3 or "")
++
++
++def test_revive_respects_parent_gates(kanban_home):
++    """Revive must not promote a child past an unfinished parent: it lands in
++    todo and recompute_ready flips it once the parent completes."""
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="parent", assignee="worker")
++        child = kb.create_task(conn, title="child", assignee="worker", parents=(parent,))
++        assert kb.get_task(conn, child).status == "todo"
++        # Park the child in triage the way the loop breaker would.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (child,))
++        ok, err = kb.revive_task(conn, child, actor="op")
++        assert (ok, err) == (True, None)
++        assert kb.get_task(conn, child).status == "todo", "parent gate must hold"
++        # Parent completes -> recompute_ready promotes the child.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
++        kb.claim_task(conn, parent, claimer="worker")
++        kb.complete_task(conn, parent, result="done")
++        kb.recompute_ready(conn)
++        assert kb.get_task(conn, child).status == "ready"
++
++
++def test_revive_clears_respawn_guard_inputs(kanban_home):
++    """A dead-model card carries last_failure_error that check_respawn_guard
++    reads as blocker_auth; revive clears it so the re-dispatch can proceed
++    once the model is fixed (combined with the dispatch liveness gate, no
++    spiral: the card only re-spawns when the probe passes)."""
++    from hermes_cli import kanban_db_dispatch as kbd
++
++    with kbc.connect_closing() as conn:
++        tid = _triage_via_loop_breaker(conn)
++        # Simulate the dead-model failure bookkeeping that precedes triage.
++        with kb.write_txn(conn):
++            conn.execute(
++                "UPDATE tasks SET last_failure_error = ?, consecutive_failures = 3 "
++                "WHERE id = ?",
++                ("spawn failed: auth error 401 invalid api key", tid),
++            )
++        # The guard holds the card before revive...
++        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
++        ok, _ = kb.revive_task(conn, tid, actor="op")
++        assert ok
++        # ...and no longer does after: the guard inputs were cleared.
++        assert kbd.check_respawn_guard(conn, tid) is None
+diff --git a/tests/hermes_cli/test_kanban_revive_cli.py b/tests/hermes_cli/test_kanban_revive_cli.py
+new file mode 100644
+index 0000000000..1b27360d15
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_revive_cli.py
+@@ -0,0 +1,79 @@
++"""CLI surface tests for `hermes kanban revive` — the triage exit verb.
++
++Exercises the same entry point the interactive CLI and gateway use
++(``run_slash``): the happy path out of triage, the clear refusal on
++non-triage cards, and bulk ids.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    kb.init_db()
++    return home
++
++
++def _triage_card(conn, title="stuck in triage"):
++    tid = kb.create_task(conn, title=title, assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++    return tid
++
++
++def test_revive_cli_moves_triage_to_ready(kanban_home):
++    with kbc.connect() as conn:
++        tid = _triage_card(conn)
++    out = kc.run_slash(f"revive {tid}")
++    assert "ready" in out
++    assert "Revived" in out
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == "ready"
++        kinds = [e.kind for e in kb.list_events(conn, tid)]
++    assert "revived" in kinds
++
++
++def test_revive_cli_rejects_non_triage_with_error(kanban_home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="normal card", assignee="worker")
++    out = kc.run_slash(f"revive {tid}")
++    assert "cannot revive" in out
++    assert "triage" in out
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == "ready"
++
++
++def test_revive_cli_bulk_and_reason(kanban_home):
++    with kbc.connect() as conn:
++        t1 = _triage_card(conn, title="one")
++        t2 = _triage_card(conn, title="two")
++    out = kc.run_slash(f"revive {t1} {t2} --reason 'model fixed'")
++    assert out.count("Revived") == 2
++    with kbc.connect() as conn:
++        for tid in (t1, t2):
++            task = kb.get_task(conn, tid)
++            assert task is not None and task.status == "ready"
++        ev = [e for e in kb.list_events(conn, t1) if e.kind == "revived"]
++        assert ev and (ev[0].payload or {}).get("reason") == "model fixed"
++
++
++def test_revive_cli_requires_ids(kanban_home):
++    out = kc.run_slash("revive")
++    assert "usage error" in out
++    assert "required" in out

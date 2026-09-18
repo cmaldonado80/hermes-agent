@@ -132,6 +132,8 @@ class DispatchResult:
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    liveness_blocked: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, provider/model, error)`` routes rejected before claim."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -162,6 +164,10 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             continue
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
+        if res.liveness_blocked:
+            counts["liveness_blocked"] = (
+                counts.get("liveness_blocked", 0) + len(res.liveness_blocked)
+            )
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
@@ -1861,6 +1867,41 @@ def _dispatch_lane_task(
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
+    if not dry_run:
+        try:
+            from hermes_cli import kanban_dispatch_liveness as _liveness
+
+            gate_enabled = _liveness.liveness_gate_enabled()
+        except Exception:
+            gate_enabled = False
+            _kb._log.debug(
+                "kanban dispatch: liveness gate setup failed open for task %s",
+                task_id,
+                exc_info=True,
+            )
+        if gate_enabled:
+            try:
+                outcome = _liveness.probe_route(
+                    assignee, row["model_override"], row["provider_override"],
+                )
+            except Exception:
+                _kb._log.debug(
+                    "kanban dispatch: liveness probe failed open for task %s",
+                    task_id,
+                    exc_info=True,
+                )
+            else:
+                if not outcome.alive:
+                    route = f"{outcome.provider}/{outcome.model}"
+                    result.liveness_blocked.append((task_id, route, outcome.error))
+                    _record_liveness_block(
+                        conn,
+                        task_id,
+                        outcome,
+                        dead_ttl_seconds=_liveness.dead_ttl_seconds(),
+                    )
+                    return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -1946,6 +1987,41 @@ def _apply_default_assignee(
         )
         return False
     return True
+
+
+def _record_liveness_block(
+    conn: sqlite3.Connection, task_id: str, outcome, *, dead_ttl_seconds: int,
+) -> None:
+    """Write one operator-visible note per cached dead episode."""
+    payload = {
+        "provider": outcome.provider,
+        "model": outcome.model,
+        "error": outcome.error,
+    }
+    previous = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'liveness_blocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if previous is not None:
+        try:
+            import json
+
+            same_error = json.loads(previous["payload"] or "null") == payload
+            within_dead_ttl = time.time() - previous["created_at"] <= dead_ttl_seconds
+            if same_error and within_dead_ttl:
+                return
+        except (TypeError, ValueError):
+            pass
+    body = (
+        f"Dispatch liveness gate: provider `{outcome.provider}` model `{outcome.model}` "
+        f"did not respond ({outcome.error}). Card left in ready; fix the provider/model "
+        "or credentials, then re-dispatch."
+    )
+    with _kb.write_txn(conn):
+        _kb.add_comment(conn, task_id, author="system", body=body)
+        _kb._append_event(conn, task_id, "liveness_blocked", payload)
 
 
 def _run_reclaim_phase(
@@ -2037,7 +2113,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, model_override, provider_override FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()

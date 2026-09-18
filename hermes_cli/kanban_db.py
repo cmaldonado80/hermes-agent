@@ -232,7 +232,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "liveness_blocked",
 )
 
 
@@ -3667,6 +3667,83 @@ def specify_triage_task(
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)
     return True
+
+
+def revive_task(
+    conn: sqlite3.Connection, task_id: str, *,
+    actor: Optional[str] = None, reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """``triage`` -> ``ready`` (or ``todo`` while a parent is unfinished): the
+    exit from the loop-detector / respawn-guard parking column.
+
+    ``triage`` is reachable from two machine paths — the unblock-loop breaker
+    (:func:`block_task` at ``BLOCK_RECURRENCE_LIMIT`) and cards parked there at
+    creation — but neither ``promote`` (todo/blocked only), ``claim``, nor
+    ``unblock`` (blocked/scheduled only) accepts it, so the only exit used to
+    be a successor card. Revive is that exit: it clears the loop-state the
+    guards key on — ``block_kind``/``block_recurrences`` (same-cause re-block
+    memory), ``consecutive_failures``/``last_failure_error`` (the circuit
+    breaker + ``respawn_guarded`` inputs) — and re-gates on parents exactly
+    like :func:`unblock_task` (``_landing_status_after_parents``), so it can
+    never promote a child past an unfinished parent.
+
+    Deliberately NOT an override for the dependency itself: an unsatisfied
+    parent lands the card in ``todo`` for :func:`recompute_ready`, mirroring
+    ``promote``'s refusal semantics without needing one.
+
+    Any status other than ``triage`` is an intentional no-op returning
+    ``(False, "<status>: only triage tasks can be revived")`` — the same
+    fail-closed shape as ``promote``/``unblock``.
+    """
+    cur_status = _task_status(conn, task_id)
+    if cur_status is None:
+        return False, f"task {task_id} not found"
+    if cur_status != "triage":
+        return False, (
+            f"task {task_id} is {cur_status!r}: only triage tasks can be revived"
+        )
+
+    now = int(time.time())
+    with write_txn(conn):
+        # Re-read under the txn: the status may have moved since the check above.
+        row = conn.execute(
+            "SELECT status, block_kind, block_recurrences, consecutive_failures, assignee "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "triage":
+            return False, f"task {task_id} is no longer in triage"
+
+        landing_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET "
+            "    status = ?, current_run_id = NULL, "
+            "    claim_lock = NULL, claim_expires = NULL, "
+            "    worker_pid = NULL, worker_started_at = NULL, "
+            "    block_kind = NULL, block_recurrences = 0, "
+            "    consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'triage'",
+            (landing_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed during revive"
+
+        # Audit trail: who, when, from where — plus the loop-state snapshot the
+        # revive cleared, so the operator can still see what triage had caught.
+        _append_event(
+            conn, task_id, "revived",
+            {
+                "from_status": "triage",
+                "status": landing_status,
+                "actor": actor,
+                "reason": reason,
+                "cleared": {
+                    "block_kind": row["block_kind"],
+                    "block_recurrences": int(row["block_recurrences"] or 0),
+                    "consecutive_failures": int(row["consecutive_failures"] or 0),
+                },
+            },
+        )
+    return True, None
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
