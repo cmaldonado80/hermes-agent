@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import run_agent
+from agent.activity_tracking import _kanban_call_in_flight
 from agent.session_activity import ActivityProvenance
 
 
@@ -75,6 +76,14 @@ def test_touch_activity_accepts_named_provenance(monkeypatch):
         description="starting API call #1",
         provenance=ActivityProvenance.UNKNOWN,
     )
+
+
+def test_long_calls_and_tool_starts_count_as_in_flight():
+    assert _kanban_call_in_flight("context compression in progress") is True
+    assert _kanban_call_in_flight("concurrent tools running (930s, 2 remaining: a, b)") is True
+    assert _kanban_call_in_flight("executing tool: terminal") is True
+    assert _kanban_call_in_flight("executing 2 tools concurrently: terminal, read_file") is True
+    assert _kanban_call_in_flight("context compression completed") is False
 
 
 def test_touch_activity_persist_errors_are_swallowed(monkeypatch):

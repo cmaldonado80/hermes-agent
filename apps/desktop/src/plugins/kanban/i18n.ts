@@ -209,6 +209,8 @@ type KanbanMessages = {
     gaveUpTitle: string
     /** Body for gave_up — the raw worker error rides in the toast `detail`. */
     gaveUpBody: string
+    emptyTimeoutBody: string
+    progressStallBody: string
     crashedTitle: string
     timedOutTitle: string
     openKanban: string
@@ -423,6 +425,8 @@ export const en: KanbanMessages = {
     blockLoopTitle: 'Task routed to triage — needs a decision',
     gaveUpTitle: 'Task stopped',
     gaveUpBody: 'Hermes couldn’t finish this task. Open Kanban to see why and reassign it.',
+    emptyTimeoutBody: 'Hermes stopped this task because it timed out without reporting progress. Open Kanban to inspect it.',
+    progressStallBody: 'Hermes stopped this task because it did not report progress in time. Open Kanban to inspect it.',
     crashedTitle: 'Task hit a problem — Hermes will retry it automatically',
     timedOutTitle: 'Task took too long — Hermes will retry it automatically',
     openKanban: 'Open Kanban',
@@ -636,6 +640,8 @@ const ja: KanbanMessages = {
     blockLoopTitle: 'タスクをトリアージへ移動 — 判断が必要です',
     gaveUpTitle: 'タスクが停止しました',
     gaveUpBody: 'Hermes はこのタスクを完了できませんでした。かんばんを開いて原因を確認し、再割り当てしてください。',
+    emptyTimeoutBody: '進捗報告がないままタイムアウトしたため、Hermes はこのタスクを停止しました。かんばんで確認してください。',
+    progressStallBody: '進捗が一定時間報告されなかったため、Hermes はこのタスクを停止しました。かんばんで確認してください。',
     crashedTitle: 'タスクで問題が発生 — Hermes が自動で再試行します',
     timedOutTitle: 'タスクに時間がかかりすぎました — Hermes が自動で再試行します',
     openKanban: 'かんばんを開く',
@@ -846,6 +852,8 @@ const zh: KanbanMessages = {
     blockLoopTitle: '任务已转入分类 — 需要人工决定',
     gaveUpTitle: '任务已停止',
     gaveUpBody: 'Hermes 无法完成这个任务。打开看板查看原因并重新分配。',
+    emptyTimeoutBody: '此任务超时且未报告进度，因此 Hermes 已将其停止。请打开看板检查。',
+    progressStallBody: '由于此任务在规定时间内未报告进度，Hermes 已将其停止。请打开看板检查。',
     crashedTitle: '任务遇到问题 — Hermes 将自动重试',
     timedOutTitle: '任务耗时过长 — Hermes 将自动重试',
     openKanban: '打开看板',
@@ -1056,6 +1064,8 @@ const zhHant: KanbanMessages = {
     blockLoopTitle: '任務已轉入分類 — 需要人工決定',
     gaveUpTitle: '任務已停止',
     gaveUpBody: 'Hermes 無法完成這個任務。開啟看板查看原因並重新指派。',
+    emptyTimeoutBody: '此任務逾時且未回報進度，因此 Hermes 已將其停止。請開啟看板檢查。',
+    progressStallBody: '由於此任務未在規定時間內回報進度，Hermes 已將其停止。請開啟看板檢查。',
     crashedTitle: '任務遇到問題 — Hermes 將自動重試',
     timedOutTitle: '任務耗時過長 — Hermes 將自動重試',
     openKanban: '開啟看板',

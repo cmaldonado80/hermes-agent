@@ -436,6 +436,17 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
 def _fmt_gave_up(ev, n) -> tuple:
     # The dispatcher auto-blocked the task after ``failures`` consecutive non-success attempts
     # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
+    stalled = _payload(ev, "trigger_outcome") == "stalled"
+    if _payload(ev, "empty_timeout") or stalled:
+        limit = int(_payload(ev, "stall_seconds" if stalled else "limit_seconds") or 0)
+        minutes = max(1, round(limit / 60)) if limit else 0
+        span = f"its {minutes}-minute limit" if minutes else "its time limit"
+        return (
+            f"⏱ {n.head} ran past {span} without reporting progress and was stopped; "
+            "it is blocked for attention.",
+            None,
+            None,
+        )
     failures = _payload(ev, "failures")
     count = f"it failed {int(failures)} times in a row" if failures else "it kept failing"
     last = _clip(ev, "error", " (last: {})", 160)
@@ -450,6 +461,13 @@ def _fmt_timed_out(ev, n) -> tuple:
     limit = int(_payload(ev, "limit_seconds") or 0)
     minutes = max(1, round(limit / 60)) if limit else 0
     span = f"its {minutes}-minute limit" if minutes else "its time limit"
+    if _payload(ev, "empty_run"):
+        return (
+            f"⏱ {n.head} ran past {span} without reporting progress and was stopped; "
+            "it is blocked for attention.",
+            None,
+            None,
+        )
     return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
 
 

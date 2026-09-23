@@ -312,17 +312,31 @@ def _kb_completed(task, payload: dict, title: str) -> str:
 
 
 def _kb_timed_out(task, payload: dict, title: str) -> str:
+    blocked = bool(payload.get("empty_run"))
+    disposition = "blocked for attention" if blocked else "will retry"
     with contextlib.suppress(TypeError, ValueError):
-        return f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); will retry"
-    return " timed out (max_runtime=0s); will retry"
+        return (
+            f" timed out (max_runtime={int(payload.get('limit_seconds') or 0)}s); "
+            f"{disposition}"
+        )
+    return f" timed out (max_runtime=0s); {disposition}"
+
+
+def _kb_gave_up(task, payload: dict, title: str) -> str:
+    if payload.get("trigger_outcome") == "stalled":
+        return " progress stalled; blocked for attention"
+    if payload.get("empty_timeout"):
+        return " timed out without progress; blocked for attention"
+    return " gave up after repeated failures" + (
+        f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
+    )
 
 
 # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
 _KANBAN_EVENT_FORMATTERS = {
     "completed": ("✔", _kb_completed),
     "blocked": ("⏸", lambda t, p, title: " blocked" + (f": {str(p.get('reason'))[:160]}" if p.get("reason") else "")),
-    "gave_up": ("✖", lambda t, p, title: " gave up after repeated spawn failures"
-                + (f"\n{str(p.get('error'))[:200]}" if p.get("error") else "")),
+    "gave_up": ("✖", _kb_gave_up),
     "crashed": ("✖", lambda t, p, title: " worker crashed (pid gone); dispatcher will retry"),
     "timed_out": ("⏱", _kb_timed_out),
     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),

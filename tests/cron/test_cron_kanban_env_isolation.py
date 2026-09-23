@@ -191,6 +191,111 @@ class TestKanbanGatesRespectContext:
         with non_dispatcher_owned_context():
             assert model_tools._is_dispatcher_owned_worker() is False
 
+    def test_activity_heartbeat_suppressed_for_cron_agent(self, worker_env, monkeypatch):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools import kanban_tools
+
+        board_opened = False
+
+        def forbidden_board(*_args, **_kwargs):
+            nonlocal board_opened
+            board_opened = True
+            raise AssertionError("a non-owning cron agent must not open the worker board")
+
+        monkeypatch.setattr(kanban_tools, "_board", forbidden_board)
+        monkeypatch.setattr(kanban_tools, "_auto_heartbeat_last_attempt", 0.0)
+        with non_dispatcher_owned_context():
+            assert kanban_tools.heartbeat_current_worker_from_env(in_flight=True) is False
+
+        assert board_opened is False
+        assert kanban_tools._auto_heartbeat_last_attempt == 0.0
+
+    def test_explicit_cron_orchestrator_operation_ignores_inherited_worker_scope(
+        self, worker_env,
+    ):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools import kanban_tools
+
+        with non_dispatcher_owned_context():
+            assert kanban_tools._worker_run_id(worker_env) is None
+            kanban_tools._require_orchestrator_tool("kanban_list")
+            assert kanban_tools._worker_guard(
+                "kanban_heartbeat", {"task_id": "t_cron_owned"},
+            ) == "t_cron_owned"
+            assert kanban_tools._worker_guard(
+                "kanban_complete", {"task_id": "t_cron_owned"},
+            ) == "t_cron_owned"
+
+    def test_tool_activity_thread_preserves_cron_non_owner_context(
+        self,
+        worker_env,
+        monkeypatch,
+    ):
+        import time
+
+        from agent import tool_executor
+        from agent.delegation_context import (
+            is_dispatcher_owned_worker_context,
+            non_dispatcher_owned_context,
+        )
+
+        ownership_seen = []
+        agent = type(
+            "Agent",
+            (),
+            {"_touch_activity": lambda self, _label: ownership_seen.append(
+                is_dispatcher_owned_worker_context()
+            )},
+        )()
+        monkeypatch.setattr(tool_executor, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.01)
+
+        with non_dispatcher_owned_context():
+            tool_executor._run_with_activity_heartbeat(
+                agent,
+                "slow-cron-tool",
+                lambda: time.sleep(0.04),
+            )
+
+        assert ownership_seen
+        assert ownership_seen == [False] * len(ownership_seen)
+
+    def test_provider_and_compression_heartbeat_threads_preserve_cron_context(
+        self,
+        worker_env,
+        monkeypatch,
+    ):
+        import time
+
+        from agent import chat_completion_helpers as helpers
+        from agent.conversation_compression import _CompressionActivityHeartbeat
+        from agent.delegation_context import (
+            is_dispatcher_owned_worker_context,
+            non_dispatcher_owned_context,
+        )
+
+        ownership_seen = []
+
+        class Agent:
+            _last_activity_provenance = None
+
+            def _touch_activity(self, *_args, **_kwargs):
+                ownership_seen.append(is_dispatcher_owned_worker_context())
+
+        monkeypatch.setattr(helpers, "_DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS", 0.01)
+        agent = Agent()
+        with non_dispatcher_owned_context():
+            request = helpers._InlineRequest(agent, {}, float("inf"), time.time())
+            request.start_watchdogs()
+            time.sleep(0.04)
+            request.stop_watchdogs()
+
+            compression = _CompressionActivityHeartbeat(agent, interval_seconds=0.01).start()
+            time.sleep(0.04)
+            compression.stop()
+
+        assert ownership_seen
+        assert ownership_seen == [False] * len(ownership_seen)
+
 
 # ---------------------------------------------------------------------------
 # run_job wiring

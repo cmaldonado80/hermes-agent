@@ -1330,7 +1330,7 @@ to the public equivalent or the new module. Test monkeypatch seams are likewise 
 | `detect_crashed_workers` | moved-lazy | `hermes_cli.kanban_db_dispatch` |
 | `detect_stale_running` | moved-lazy | `hermes_cli.kanban_db_dispatch` |
 | `dispatch_once` | moved-lazy | `hermes_cli.kanban_db_dispatch` |
-| `enforce_max_runtime` | moved-lazy | `hermes_cli.kanban_db_dispatch` |
+| `enforce_max_runtime` | moved-lazy | `hermes_cli.kanban_db_progress` |
 | `field` | import | `dataclasses` |
 | `has_spawnable_ready` | moved-lazy | `hermes_cli.kanban_db_dispatch` |
 | `has_spawnable_review` | moved-lazy | `hermes_cli.kanban_db_dispatch` |

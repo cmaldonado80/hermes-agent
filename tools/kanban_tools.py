@@ -177,13 +177,17 @@ def _kanban_handler(tool_name: str) -> Callable:
 
 
 def _reject_delegated_child_mutation(tool_name: str) -> None:
-    """A delegate_task child shares the parent's process, so inherited HERMES_KANBAN_*
-    env is not proof of ownership: it may report findings but must not mutate."""
+    """Reject delegate descendants, which never receive board write authority.
+
+    In-process cron jobs are different: the non-owner ContextVar suppresses the
+    inherited worker identity, but a cron profile that explicitly enables the
+    Kanban toolset remains an ordinary orchestrator and may use explicit ids.
+    """
     if _delegation_ctx("is_delegated_child_process_context", False):
         raise _Reject(
-            f"{tool_name} refused: delegate_task child agents are not Kanban run owners. "
-            "Return findings to the parent agent; the dispatcher worker or an explicitly "
-            "configured Kanban orchestrator must perform board mutations.")
+            f"{tool_name} refused: delegate_task child agents do not have Kanban write authority. "
+            "Return findings to the parent agent; the dispatcher worker or an explicitly configured "
+            "Kanban orchestrator must perform board mutations.")
 
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
@@ -204,6 +208,8 @@ def _require_task_id(args: dict) -> str:
 
 def _own_task_env(task_id: str, var: str) -> Optional[str]:
     """``$var`` only when this worker is scoped to ``task_id``; else None."""
+    if not _is_dispatcher_owned_worker():
+        return None
     return os.environ.get(var) if os.environ.get("HERMES_KANBAN_TASK") == task_id else None
 
 
@@ -231,7 +237,11 @@ def _enforce_worker_task_ownership(tid: str) -> None:
     a buggy or prompt-injected worker that passed an explicit ``task_id`` for some other task could corrupt
     sibling or cross-tenant runs (see #19534).
     """
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    env_tid = (
+        os.environ.get("HERMES_KANBAN_TASK")
+        if _is_dispatcher_owned_worker()
+        else None
+    )
     if env_tid and tid != env_tid:
         raise _Reject(
             f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
@@ -259,6 +269,7 @@ def _worker_guard(tool_name: str, args: dict) -> str:
     _enforce_worker_task_ownership(tid)
     if (
         tool_name in _RUN_LIFECYCLE_TOOLS
+        and _is_dispatcher_owned_worker()
         and os.environ.get("HERMES_KANBAN_TASK")
         and _worker_run_id(tid) is None
     ):
@@ -276,7 +287,7 @@ def _worker_guard(tool_name: str, args: dict) -> str:
 def _require_orchestrator_tool(tool_name: str) -> None:
     """The check_fn already hides orchestrator tools from workers; this catches
     a stale registration or test harness routing a worker here anyway."""
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         raise _Reject(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers must use "
             "kanban_complete, kanban_request_review, kanban_request_changes, kanban_block, "
@@ -509,32 +520,49 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
 # a known-long op. Constraints: - Best-effort: never raise. The agent loop must not care if the bridge fails
 # (board missing, DB locked, etc.). - Rate-limited to one DB write per 60s per-process; runtime activity can
 # tick on every chunk/tool result and we don't need that resolution. - No-op outside dispatcher-spawned
-# worker context (no ``HERMES_KANBAN_TASK``). - No durable note on these auto-heartbeats; that's reserved
-# for the explicit tool which carries a model-supplied note.
+# worker context (no ``HERMES_KANBAN_TASK``). - No durable note on these auto-heartbeats; the bridge records
+# only whether a model/tool call is actively in flight, while the explicit tool carries a model-supplied note.
 _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
+_auto_heartbeat_last_in_flight = False
 _auto_heartbeat_fence_warned = False
 
 
-def heartbeat_current_worker_from_env() -> bool:
+def heartbeat_current_worker_from_env(*, in_flight: bool = False) -> bool:
     """Claim extension + board heartbeat for the current worker; True iff both writes
     succeed. ``HERMES_KANBAN_RUN_ID`` pins the run row so a reclaimed stale run is not
     heartbeated; ``HERMES_KANBAN_CLAIM_LOCK`` absent -> default claimer (local workers)."""
-    global _auto_heartbeat_last_attempt, _auto_heartbeat_fence_warned
+    global _auto_heartbeat_last_attempt, _auto_heartbeat_last_in_flight
+    global _auto_heartbeat_fence_warned
     tid = os.environ.get("HERMES_KANBAN_TASK")
     now = time.monotonic()
-    if not tid or (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
+    within_rate_window = (
+        now - _auto_heartbeat_last_attempt
+    ) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS
+    dispatcher_owned = _is_dispatcher_owned_worker()
+    delegated_process = _delegation_ctx("is_delegated_child_process_context", False)
+    if (
+        not tid
+        or _is_delegated_child_context()
+        or (not dispatcher_owned and not delegated_process)
+        or (within_rate_window and (not in_flight or _auto_heartbeat_last_in_flight))
+    ):
         return False
-    if _is_delegated_child_context():
-        # An in-process delegate child's activity is not the worker's liveness; checked before
-        # stamping the window so a chatty child cannot starve the worker's own heartbeat.
-        return False
+    # Ownership is checked before stamping the window so activity from an in-process
+    # delegate child or cron agent cannot masquerade as the worker's progress. An exec'd
+    # descendant keeps reaching the fenced board path below so its one-time diagnostic
+    # warning remains visible instead of becoming a silent no-op.
     _auto_heartbeat_last_attempt = now
+    _auto_heartbeat_last_in_flight = bool(in_flight)
     try:
         from hermes_cli import kanban_db_dispatch as kbd
         with _board(None, quiet_close=True) as (kb, conn):
             ops = ((kb.heartbeat_claim, {"claimer": os.environ.get("HERMES_KANBAN_CLAIM_LOCK")}),
-                   (kbd.heartbeat_worker, {"note": None, "expected_run_id": _worker_run_id(tid)}))
+                   (kbd.heartbeat_worker, {
+                       "note": None,
+                       "expected_run_id": _worker_run_id(tid),
+                       "in_flight": bool(in_flight),
+                   }))
             succeeded = True
             for fn, kwargs in ops:
                 op = fn.__name__
@@ -866,7 +894,12 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         # claimer covers locally-driven workers that bypassed the dispatcher.
         kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         ok = kbd.heartbeat_worker(
-            conn, tid, note=args.get("note"), expected_run_id=_worker_run_id(tid))
+            conn,
+            tid,
+            note=args.get("note"),
+            expected_run_id=_worker_run_id(tid),
+            explicit=True,
+        )
         _check(ok, f"could not heartbeat {tid} (unknown id or not running)")
         return _ok(task_id=tid)
 
@@ -889,7 +922,13 @@ def _handle_comment(args: dict, **kw) -> str:
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
-        cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        cid = kb.add_comment(
+            conn,
+            tid,
+            author=author,
+            body=str(body),
+            run_id=_worker_run_id(tid),
+        )
         return _ok(task_id=tid, comment_id=cid)
 
 

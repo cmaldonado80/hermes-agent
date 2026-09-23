@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
-from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
+from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 from agent.usage_anchor import set_usage_anchor
@@ -1789,7 +1789,11 @@ class _CompressionActivityHeartbeat:
         # quiet context engines emit neither (#98371 follow-up).
         self._emit_client_status = emit_client_status
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="compression-activity-heartbeat", daemon=True)
+        self._thread = threading.Thread(
+            target=ctx_bound(self._run),
+            name="compression-activity-heartbeat",
+            daemon=True,
+        )
 
     def start(self) -> "_CompressionActivityHeartbeat":
         # A new compression episode always republishes agent.compression even

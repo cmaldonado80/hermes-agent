@@ -29,6 +29,41 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def test_empty_timeout_notification_does_not_promise_a_retry():
+    from gateway.kanban_watchers_notifier import _fmt_gave_up
+
+    event = SimpleNamespace(payload={"limit_seconds": 60, "empty_timeout": True})
+    message, handoff, review_detail = _fmt_gave_up(
+        event, SimpleNamespace(head="Kanban t_empty")
+    )
+
+    assert "without reporting progress" in message
+    assert "blocked for attention" in message
+    assert "retried automatically" not in message
+    assert handoff is None and review_detail is None
+
+
+def test_progress_stall_notification_explains_no_progress():
+    from gateway.kanban_watchers_notifier import _fmt_gave_up
+
+    event = SimpleNamespace(
+        payload={
+            "stall_seconds": 120,
+            "trigger_outcome": "stalled",
+            "empty_run": True,
+        }
+    )
+    message, handoff, review_detail = _fmt_gave_up(
+        event, SimpleNamespace(head="Kanban t_stalled")
+    )
+
+    assert "without reporting progress" in message
+    assert "2-minute limit" in message
+    assert "blocked for attention" in message
+    assert "failed 1 times" not in message
+    assert handoff is None and review_detail is None
+
+
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
     """delivery_mode persists; an explicit re-subscribe is last-write-wins, a
     ``None`` re-subscribe leaves the existing mode untouched, an unknown value
@@ -1210,5 +1245,3 @@ def test_gc_purges_blocked_task_that_never_done(kanban_home):
         assert kbn.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
-
-

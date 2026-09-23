@@ -249,6 +249,20 @@ class TestFormatKanbanEventText:
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
 
+        empty = SimpleNamespace(
+            kind="timed_out", payload={"limit_seconds": 60, "empty_run": True},
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, empty, "")
+        assert "blocked for attention" in text
+        assert "will retry" not in text
+
+        stalled = SimpleNamespace(
+            kind="gave_up", payload={"trigger_outcome": "stalled"},
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, stalled, "")
+        assert "progress stalled" in text
+        assert "spawn failures" not in text
+
 
 class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.

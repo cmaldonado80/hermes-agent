@@ -22,6 +22,8 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_progress as kbp
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +506,22 @@ def test_dispatch_dry_run(client):
     body = r.json()
     # DispatchResult is serialized as a dataclass dict.
     assert isinstance(body, dict)
+
+
+def test_dispatch_nudge_honors_disabled_progress_watchdog(client, monkeypatch):
+    seen = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        seen.update(kwargs)
+        return kbd.DispatchResult()
+
+    monkeypatch.setattr(kbp, "configured_progress_stall_timeout_seconds", lambda: 0)
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+
+    response = client.post("/api/plugins/kanban/dispatch")
+
+    assert response.status_code == 200
+    assert seen["progress_stall_timeout_seconds"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1151,5 +1169,3 @@ def test_touch_card_tap_opens_instead_of_dragging():
 # ---------------------------------------------------------------------------
 # Diagnostic severity colours follow the dashboard theme
 # ---------------------------------------------------------------------------
-
-

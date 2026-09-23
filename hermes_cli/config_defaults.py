@@ -1906,6 +1906,10 @@ DEFAULT_CONFIG = {
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
+        # Block a live host-local worker after this many seconds without a run-scoped comment,
+        # explicit heartbeat, or active model/tool call. Positive values below twice the
+        # 60-second activity-heartbeat cadence are clamped to 120; 0 disables the watchdog.
+        "progress_stall_timeout_seconds": 900,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.

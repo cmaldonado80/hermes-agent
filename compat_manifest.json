@@ -3564,7 +3564,7 @@
    "facade": "hermes_cli.kanban_db",
    "name": "enforce_max_runtime",
    "kind": "moved-lazy",
-   "target": "hermes_cli.kanban_db_dispatch"
+   "target": "hermes_cli.kanban_db_progress"
   },
   {
    "facade": "hermes_cli.kanban_db",

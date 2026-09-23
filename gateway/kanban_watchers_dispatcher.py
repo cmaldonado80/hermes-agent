@@ -16,6 +16,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
+from hermes_cli.kanban_db_progress import (
+    DEFAULT_PROGRESS_STALL_TIMEOUT_SECONDS,
+    configured_progress_stall_timeout_seconds,
+)
 
 
 def _kbc():
@@ -42,6 +46,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    progress_stall_timeout_seconds: int = DEFAULT_PROGRESS_STALL_TIMEOUT_SECONDS
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -108,6 +113,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         max_in_progress=effective_max_in_progress,
         failure_limit=failure_limit,
         stale_timeout_seconds=stale_timeout_seconds,
+        progress_stall_timeout_seconds=configured_progress_stall_timeout_seconds(kanban_cfg),
         # Requeue 'running' cards with broken claim bookkeeping (zombie-card
         # reconciliation); false keeps orphans frozen for manual forensics.
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),

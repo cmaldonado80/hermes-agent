@@ -14,6 +14,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_progress as kbp
 
 
 @pytest.fixture
@@ -49,7 +50,7 @@ def test_recycled_pid_is_reclaimed_without_being_signalled(board):
     tid = _claimed_running(conn, pid=os.getpid(), started_at=stranger_fingerprint, max_runtime=1)
 
     assert kbd._worker_alive(os.getpid(), stranger_fingerprint) is False
-    assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    assert tid in kbp.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
     assert killed == []
     task = kb.get_task(conn, tid)
     assert task.status == "ready" and task.worker_pid is None
@@ -76,7 +77,7 @@ def test_matching_fingerprint_keeps_the_live_worker(board):
 
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET max_runtime_seconds = 1 WHERE id = ?", (tid,))
-    kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    kbp.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
     assert killed and killed[0] == (os.getpid(), signal.SIGTERM)
 
 
@@ -99,7 +100,7 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_started_at = ? WHERE id = ?", (other_boot, tid))
     assert kbd._worker_alive(os.getpid(), other_boot) is False
-    assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    assert tid in kbp.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
     assert killed == []
     task = kb.get_task(conn, tid)
     assert task.status == "ready" and task.worker_pid is None
@@ -132,7 +133,7 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
                      (old, tid))
 
     sig = lambda pid, s: killed.append((pid, s))  # noqa: E731
-    assert kbd.enforce_max_runtime(conn, signal_fn=sig) == []
+    assert kbp.enforce_max_runtime(conn, signal_fn=sig) == []
     assert kb.release_stale_claims(conn, signal_fn=sig) == 0
     assert killed == []
     assert kb.get_task(conn, tid).status == "running"

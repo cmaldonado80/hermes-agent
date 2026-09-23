@@ -15,6 +15,7 @@ from pathlib import Path
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_progress as kbp
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
 
@@ -78,9 +79,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
+        progress_stall_timeout_seconds = kbp.configured_progress_stall_timeout_seconds(_kanban_cfg)
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        progress_stall_timeout_seconds = kbp.DEFAULT_PROGRESS_STALL_TIMEOUT_SECONDS
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -88,14 +91,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            progress_stall_timeout_seconds=progress_stall_timeout_seconds,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
-               for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
-                         "reaped_terminal_workers")},
+               for k in ("reclaimed", "crashed", "timed_out", "stale", "progress_stalled",
+                         "auto_blocked", "promoted", "reaped_terminal_workers")},
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
             ],
@@ -122,6 +126,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         ("Crashed:     ", res.crashed),
         ("Timed out:   ", res.timed_out),
         ("Stale:       ", res.stale),
+        ("Progress stall:", res.progress_stalled),
         ("Auto-blocked:", res.auto_blocked),
     ):
         print(f"{label} {len(items)}")
@@ -238,12 +243,13 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
-            or res.spawned or res.auto_blocked or res.stale
+            or res.spawned or res.auto_blocked or res.stale or res.progress_stalled
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] reclaimed={res.reclaimed} "
-                f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} stale={len(res.stale)} "
+                f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} "
+                f"stale={len(res.stale)} progress_stalled={len(res.progress_stalled)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
                 f"auto_blocked={len(res.auto_blocked)}",
                 flush=True,

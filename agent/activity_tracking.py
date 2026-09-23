@@ -15,6 +15,25 @@ from agent.session_activity import ActivityProvenance
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
 
+_KANBAN_IN_FLIGHT_ACTIVITY_PREFIXES = (
+    "context compression in progress",
+    "concurrent tools running",
+    "executing tool:",
+    "executing ",
+    "local model loading",
+    "receiving stream response",
+    "sequential tool running",
+    "tool running:",
+    "waiting for non-streaming API response",
+    "waiting for provider response",
+    "waiting for stream response",
+)
+
+
+def _kanban_call_in_flight(description: str) -> bool:
+    """Whether an activity tick proves a model/tool call is still executing."""
+    return str(description).startswith(_KANBAN_IN_FLIGHT_ACTIVITY_PREFIXES)
+
 
 def _activity_lock(obj) -> "threading.Lock":
     """Lazy per-instance ``_turn_liveness_activity_lock`` (so ``__new__``/SimpleNamespace doubles work)."""
@@ -75,7 +94,9 @@ class ActivityTrackingMixin:
                 from tools.kanban_tools import (
                     heartbeat_current_worker_from_env, inject_new_comments_from_env
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(
+                    in_flight=_kanban_call_in_flight(desc),
+                )
                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
                 inject_new_comments_from_env(self)
         if force_persist:

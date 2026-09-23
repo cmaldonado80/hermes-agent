@@ -855,7 +855,11 @@ class _InlineRequest:
         self.lock = threading.Lock()
         self.abort_hook = self.abort  # single bound object: identity-checked on cleanup
         self._hb_stop = threading.Event()
-        self._hb = threading.Thread(target=self._activity_heartbeat, name="direct-api-activity-hb", daemon=True)
+        self._hb = threading.Thread(
+            target=_context_thread_target(self._activity_heartbeat),
+            name="direct-api-activity-hb",
+            daemon=True,
+        )
         self._watchdog = None
 
     def _activity_heartbeat(self) -> None:
@@ -878,7 +882,10 @@ class _InlineRequest:
         """Start the activity heartbeat and (for a finite budget) the stale timer."""
         self._hb.start()
         if math.isfinite(self.stale_timeout) and self.stale_timeout > 0:
-            self._watchdog = threading.Timer(self.stale_timeout, self._on_stale)
+            self._watchdog = threading.Timer(
+                self.stale_timeout,
+                _context_thread_target(self._on_stale),
+            )
             self._watchdog.name = "direct-api-stale-watchdog"
             self._watchdog.daemon = True
             self._watchdog.start()

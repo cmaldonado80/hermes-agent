@@ -20,6 +20,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_progress as kbp
 from hermes_cli import kanban_db_workspace as kbw
 
 
@@ -292,7 +293,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
                     (old_started, tid),
                 )
 
-            timed_out = kbd.enforce_max_runtime(conn, signal_fn=_signal_fn)
+            timed_out = kbp.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
             assert killed and killed[0][0] == os.getpid()
 

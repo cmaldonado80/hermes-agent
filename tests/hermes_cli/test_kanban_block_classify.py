@@ -8,6 +8,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_progress as kbp
 
 
 @pytest.fixture
@@ -31,7 +32,7 @@ def _time_out_once(conn, tid: str) -> None:
             "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
             (started, tid),
         )
-    assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: None)
+    assert tid in kbp.enforce_max_runtime(conn, signal_fn=lambda pid, sig: None)
 
 
 def test_typed_block_classifies_untyped_breaker_block(kanban_home, monkeypatch):

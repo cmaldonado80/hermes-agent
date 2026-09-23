@@ -112,16 +112,31 @@ def _latest_event_ts(events: Iterable[Any], kinds: set[str]) -> int:
     return max([0, *(_event_ts(ev) for ev in events if _event_kind(ev) in kinds)])
 
 
-def _latest_gave_up_is_terminal_provider(events: Iterable[Any]) -> bool:
-    """True when the most recent breaker trip was a terminal provider error (credential
-    revoked, model gone) and nothing has resumed the task since."""
+def _latest_gave_up_has_flag(events: Iterable[Any], flag: str) -> bool:
+    """Whether the latest active breaker trip carries ``flag``."""
     for ev in reversed(list(events)):
         kind = _event_kind(ev)
         if kind == "gave_up":
-            return bool(_parse_payload(ev).get("terminal_provider"))
+            return bool(_parse_payload(ev).get(flag))
         if kind in {"unblocked", "promoted", "completed", "claimed"}:
             return False
     return False
+
+
+def _latest_gave_up_has_outcome(events: Iterable[Any], outcome: str) -> bool:
+    """Whether the latest active breaker trip was caused by ``outcome``."""
+    for ev in reversed(list(events)):
+        kind = _event_kind(ev)
+        if kind == "gave_up":
+            return _parse_payload(ev).get("trigger_outcome") == outcome
+        if kind in {"unblocked", "promoted", "completed", "claimed"}:
+            return False
+    return False
+
+
+def _latest_gave_up_is_terminal_provider(events: Iterable[Any]) -> bool:
+    """True when the active breaker trip was a terminal provider error."""
+    return _latest_gave_up_has_flag(events, "terminal_provider")
 
 
 def _cli_hint(label: str, command: str, *, suggested: bool = False) -> DiagnosticAction:
@@ -364,7 +379,12 @@ def _failure_threshold(cfg: dict) -> Any:
     return cfg.get("failure_threshold", cfg.get("spawn_failure_threshold", 3))
 
 
-_OUTCOME_LABELS = {"spawn_failed": "spawn", "timed_out": "timeout", "crashed": "crash"}
+_OUTCOME_LABELS = {
+    "spawn_failed": "spawn",
+    "timed_out": "timeout",
+    "crashed": "crash",
+    "stalled": "progress stall",
+}
 
 
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
@@ -381,21 +401,33 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     threshold = _positive_int(_failure_threshold(cfg), 3)
     failure_limit = _positive_int(cfg.get("failure_limit"), threshold)
     failures = _first_field(task, "consecutive_failures", "spawn_failures", 0)
+    most_recent_outcome = next(
+        (oc for oc in (_task_field(r, "outcome") for r in _runs_newest_first(runs))
+         if oc in {"spawn_failed", "timed_out", "crashed", "stalled"}),
+        None,
+    )
     # A terminal provider error (credential revoked, model gone) blocks the card after ONE
     # attempt, below any threshold; it still needs an operator, so diagnose it now.
     terminal_trip = _latest_gave_up_is_terminal_provider(events)
-    if not terminal_trip and (failures is None or failures < threshold):
+    # A progress stall also force-trips on its first occurrence because blindly
+    # retrying the same silent worker is unlikely to help.
+    progress_stall_trip = (
+        _task_field(task, "status") == "blocked"
+        and most_recent_outcome == "stalled"
+        and _latest_gave_up_has_outcome(events, "stalled")
+    )
+    empty_timeout_trip = (
+        _task_field(task, "status") == "blocked"
+        and most_recent_outcome == "timed_out"
+        and _latest_gave_up_has_flag(events, "empty_timeout")
+    )
+    if not terminal_trip and not progress_stall_trip and not empty_timeout_trip and (
+        failures is None or failures < threshold
+    ):
         return []
     failures = failures or 0
     last_err = _first_field(task, "last_failure_error", "last_spawn_error")
     assignee = _task_field(task, "assignee")
-
-    # Most recent failure outcome makes the title/action specific.
-    most_recent_outcome = next(
-        (oc for oc in (_task_field(r, "outcome") for r in _runs_newest_first(runs))
-         if oc in {"spawn_failed", "timed_out", "crashed"}),
-        None,
-    )
 
     actions: list[DiagnosticAction] = []
     if most_recent_outcome == "spawn_failed" and assignee and assignee != "default":
@@ -403,7 +435,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
         doctor, auth = f"hermes -p {assignee} doctor", f"hermes -p {assignee} auth"
         actions.append(_cli_hint(f"Verify profile: {doctor}", doctor, suggested=True))
         actions.append(_cli_hint(f"Fix profile auth: {auth}", auth))
-    elif most_recent_outcome in {"timed_out", "crashed"}:
+    elif most_recent_outcome in {"timed_out", "crashed", "stalled"}:
         # Worker got off the ground but died: logs diagnose, reclaim/reassign recover.
         task_id = _task_field(task, "id")
         if task_id:

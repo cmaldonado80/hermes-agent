@@ -25,6 +25,12 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_db_progress import (
+    DEFAULT_PROGRESS_STALL_TIMEOUT_SECONDS as _DEFAULT_PROGRESS_STALL_TIMEOUT_SECONDS,
+    PROGRESS_PROTOCOL_VERSION as _PROGRESS_PROTOCOL_VERSION,
+    detect_progress_stall as _detect_progress_stall,
+    enforce_max_runtime as _enforce_max_runtime,
+)
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -137,6 +143,8 @@ class DispatchResult:
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+    progress_stalled: list[str] = field(default_factory=list)
+    """Task ids blocked after worker-authored progress stopped."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
@@ -440,6 +448,86 @@ def _sigkill(kill, pid: int) -> bool:
         return False
 
 
+def _request_reclaimed_worker_termination(
+    pid: Optional[int],
+    claim_lock: Optional[str],
+    *,
+    signal_fn=None,
+    started_at=None,
+) -> tuple[dict[str, Any], Optional[Callable[[int, int], None]]]:
+    """Validate worker identity and send SIGTERM without waiting for exit.
+
+    This split lets a caller serialize its final database predicate with the
+    signal while keeping the potentially five-second exit poll outside a write
+    transaction.
+    """
+    info: dict[str, Any] = {
+        "prev_pid": int(pid) if pid else None,
+        "host_local": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+    }
+    if not pid or pid <= 0 or not claim_lock:
+        return info, None
+    if not str(claim_lock).startswith(_kb._host_prefix()):
+        return info, None
+    info["host_local"] = True
+
+    kill = _kill_fn(signal_fn)
+    if kill is None:
+        return info, None
+    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
+        # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
+        info["signal_refused"] = True
+        info["terminated"] = not _kb._pid_alive(pid)
+        return info, kill
+    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
+        info["terminated"] = True
+        info["pid_recycled"] = True
+        return info, kill
+
+    info["termination_attempted"] = True
+    try:
+        kill(int(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        # Already gone = successful termination. Leaving terminated=False would
+        # make the reclaim guard misread a dead worker as alive and defer forever.
+        info["terminated"] = True
+        return info, kill
+    except OSError:
+        info["signal_failed"] = True
+        return info, kill
+    return info, kill
+
+
+def _finish_reclaimed_worker_termination(
+    pid: Optional[int],
+    started_at,
+    info: dict[str, Any],
+    kill: Optional[Callable[[int, int], None]],
+) -> dict[str, Any]:
+    """Poll and escalate a previously requested worker termination."""
+    if (
+        not pid
+        or kill is None
+        or info.get("terminated")
+        or info.get("signal_failed")
+        or not info.get("termination_attempted")
+    ):
+        return info
+
+    if _poll_worker_exit(pid, started_at):
+        info["terminated"] = True
+        return info
+    if _worker_alive(pid, started_at):
+        if not _sigkill(kill, pid):
+            return info
+        info["sigkill"] = True
+    info["terminated"] = not _worker_alive(pid, started_at)
+    return info
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -453,52 +541,10 @@ def _terminate_reclaimed_worker(
     UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
     it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
     spawning a duplicate beside it."""
-    info: dict[str, Any] = {
-        "prev_pid": int(pid) if pid else None,
-        "host_local": False,
-        "termination_attempted": False,
-        "terminated": False,
-        "sigkill": False,
-    }
-    if not pid or pid <= 0 or not claim_lock:
-        return info
-    if not str(claim_lock).startswith(_kb._host_prefix()):
-        return info
-    info["host_local"] = True
-
-    kill = _kill_fn(signal_fn)
-    if kill is None:
-        return info
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
-        info["signal_refused"] = True
-        info["terminated"] = not _kb._pid_alive(pid)
-        return info
-    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
-        info["terminated"] = True
-        info["pid_recycled"] = True
-        return info
-
-    info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Already gone = successful termination. Leaving terminated=False would
-        # make the reclaim guard misread a dead worker as alive and defer forever.
-        info["terminated"] = True
-        return info
-    except OSError:
-        return info
-
-    if _poll_worker_exit(pid, started_at):
-        info["terminated"] = True
-        return info
-    if _worker_alive(pid, started_at):
-        if not _sigkill(kill, pid):
-            return info
-        info["sigkill"] = True
-    info["terminated"] = not _worker_alive(pid, started_at)
-    return info
+    info, kill = _request_reclaimed_worker_termination(
+        pid, claim_lock, signal_fn=signal_fn, started_at=started_at,
+    )
+    return _finish_reclaimed_worker_termination(pid, started_at, info, kill)
 
 
 def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
@@ -613,6 +659,8 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    explicit: bool = False,
+    in_flight: bool = False,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -637,107 +685,28 @@ def heartbeat_worker(
         )
         if run_id is not None:
             conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (now, run_id))
-        _kb._append_event(
-            conn, task_id, "heartbeat",
-            {"note": note} if note else None,
-            run_id=run_id,
-        )
+        if expected_run_id is None:
+            # Manual/orchestrator heartbeats extend liveness, but they do not
+            # prove that the active worker authored progress for this run.
+            payload = {"note": note, "unbound": True} if note else {"unbound": True}
+        elif explicit:
+            payload = {"progress_protocol": _PROGRESS_PROTOCOL_VERSION, "explicit": True}
+            if note:
+                payload["note"] = note
+        elif in_flight:
+            payload = {
+                "progress_protocol": _PROGRESS_PROTOCOL_VERSION,
+                "in_flight": True,
+            }
+        else:
+            # A run only opts into stall supervision after its worker proves it
+            # understands the progress protocol.  This keeps older HERMES_BIN
+            # installs and custom spawn_fn workers on legacy liveness semantics.
+            payload = {"progress_protocol": _PROGRESS_PROTOCOL_VERSION}
+            if note:
+                payload["note"] = note
+        _kb._append_event(conn, task_id, "heartbeat", payload, run_id=run_id)
     return True
-
-
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
-    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
-
-    SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
-    task's source phase so the next tick re-spawns the same kind of worker —
-    unless the circuit breaker already gave up, leaving it blocked. Host-local
-    only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
-    """
-    timed_out: list[str] = []
-    now = int(time.time())
-    host_prefix = _kb._host_prefix()
-
-    rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
-        "FROM tasks t "
-        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
-        "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
-    ).fetchall()
-    for row in rows:
-        lock = row["claim_lock"] or ""
-        if not lock.startswith(host_prefix):
-            continue
-        # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
-        # so retries must be measured from the active task_runs row.
-        elapsed = now - int(row["active_started_at"])
-        limit = int(row["max_runtime_seconds"])
-        if elapsed < limit:
-            continue
-
-        pid = int(row["worker_pid"])
-        tid = row["id"]
-        started_at = _kb._row_get(row, "worker_started_at")
-        if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
-            # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
-            # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
-            _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
-                             "identity; not signalled", tid, pid)
-            continue
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone.
-        killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
-                killed = _sigkill(kill, pid)
-
-        error = f"elapsed {int(elapsed)}s > limit {limit}s"
-        with _kb.write_txn(conn):
-            retry_status = _kb._retry_status_for_run(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
-            )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": limit,
-                    "sigkill": killed,
-                    "retry_status": retry_status,
-                }
-                run_id = _kb._end_run(
-                    conn, tid, outcome="timed_out", status="timed_out",
-                    error=error, metadata=payload,
-                )
-                _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
-                timed_out.append(tid)
-        # Outside the write_txn above because ``_record_task_failure`` opens its
-        # own. If the breaker trips this flips the task to ``blocked`` and emits
-        # ``gave_up`` on top of the ``timed_out`` already emitted.
-        if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=error,
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
-            )
-    return timed_out
 
 
 # A running task with no heartbeat for this long is inactive regardless of
@@ -769,7 +738,8 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       t.current_run_id "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running'"
@@ -1470,7 +1440,16 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+        _kb._append_event(
+            conn,
+            task_id,
+            "spawned",
+            {
+                "pid": int(pid),
+                "started_at": started_at,
+            },
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1926,6 +1905,7 @@ def dispatch_once(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    progress_stall_timeout_seconds: int = _DEFAULT_PROGRESS_STALL_TIMEOUT_SECONDS,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -1949,6 +1929,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
+            progress_stall_timeout_seconds=progress_stall_timeout_seconds,
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
@@ -2138,6 +2119,7 @@ def _run_reclaim_phase(
     result: DispatchResult,
     *,
     stale_timeout_seconds: int,
+    progress_stall_timeout_seconds: int,
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
@@ -2154,7 +2136,10 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = _enforce_max_runtime(conn)
+    result.progress_stalled = _detect_progress_stall(
+        conn, stall_timeout_seconds=progress_stall_timeout_seconds,
+    )
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2288,6 +2273,7 @@ def _dispatch_once_locked(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    progress_stall_timeout_seconds: int = _DEFAULT_PROGRESS_STALL_TIMEOUT_SECONDS,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -2301,6 +2287,7 @@ def _dispatch_once_locked(
     result = DispatchResult()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
+        progress_stall_timeout_seconds=progress_stall_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
@@ -2944,12 +2931,16 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            from hermes_cli.kanban_db_progress import configured_progress_stall_timeout_seconds
+
+            progress_stall_timeout_seconds = configured_progress_stall_timeout_seconds()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    progress_stall_timeout_seconds=progress_stall_timeout_seconds,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):

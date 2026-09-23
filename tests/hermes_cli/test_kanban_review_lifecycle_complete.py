@@ -19,6 +19,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_progress as kbp
 from hermes_cli import kanban_diagnostics as kd
 
 
@@ -484,7 +485,7 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
             "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
             (999_998, old, timed_out_run.current_run_id),
         )
-    assert timed_out_id in kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None)
+    assert timed_out_id in kbp.enforce_max_runtime(conn, signal_fn=lambda *_: None)
     timed_out = kb.get_task(conn, timed_out_id)
     assert timed_out is not None
     assert timed_out.status == "review"

@@ -615,8 +615,10 @@ def _run_tool_activity_heartbeat(
 
 def _run_with_activity_heartbeat(agent, function_name: str, fn):
     """Run ``fn()`` under the activity heartbeat; covers both executor paths."""
+    from agent.memory_provider import spawn_context_thread
+
     stop = threading.Event()
-    thread = threading.Thread(
+    thread = spawn_context_thread(
         # Keep the gateway turn-inactivity watchdog from abandoning a turn whose tool call runs silently for
         # longer than the inactivity timeout (#84491): stamp activity periodically while the tool is in
         # flight, not just at start/completion. Both the sequential and the concurrent paths funnel through
@@ -624,7 +626,6 @@ def _run_with_activity_heartbeat(agent, function_name: str, fn):
         target=_run_tool_activity_heartbeat,
         args=(agent, stop, f"tool running: {function_name}"),
         kwargs={"interval": _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S, "worker_tid": threading.current_thread().ident},
-        daemon=True,
         name=f"tool-activity-hb-{function_name[:24]}",
     )
     thread.start()

@@ -441,6 +441,33 @@ describe('terminal kinds beyond completed', () => {
     expect(hostMock.notify).toHaveBeenCalledTimes(3)
     expect(hostMock.notify.mock.calls[1][0]).toMatchObject({ kind: 'error', message: 't102' })
     expect(hostMock.notify.mock.calls[2][0]).toMatchObject({ kind: 'warning', message: 't103' })
+
+    await m.onKanbanEventsFrame('smoke', [ev(104, 'timed_out', { limit_seconds: 900, empty_run: true })])
+    expect(lastNotify()).toMatchObject({ kind: 'warning', message: 't104', title: 'Task stopped' })
+    expect(lastNotify().title).not.toContain('retry')
+
+    await m.onKanbanEventsFrame('smoke', [ev(105, 'gave_up', { limit_seconds: 900, empty_timeout: true })])
+    expect(lastNotify()).toMatchObject({
+      kind: 'warning',
+      message: expect.stringContaining('timed out without reporting progress'),
+      title: 'Task stopped'
+    })
+    expect(lastNotify().detail).toBe('t105')
+
+    await m.onKanbanEventsFrame('smoke', [
+      ev(106, 'gave_up', {
+        error: 'no worker comment or in-flight call for 120s',
+        trigger_outcome: 'stalled',
+        stall_seconds: 120,
+        empty_run: true
+      })
+    ])
+    expect(lastNotify()).toMatchObject({
+      kind: 'warning',
+      message: expect.stringContaining('did not report progress in time'),
+      title: 'Task stopped',
+      detail: 't106'
+    })
   })
 
   it('gave_up without a payload error still gets the plain-words body and no empty detail noise', async () => {

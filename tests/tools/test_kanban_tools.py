@@ -82,6 +82,34 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_explicit_cron_orchestrator_can_create_and_link(worker_env):
+    """A cron run may inherit worker env without inheriting worker ownership."""
+    from agent.delegation_context import non_dispatcher_owned_context
+    from tools import kanban_tools as kt
+
+    with non_dispatcher_owned_context():
+        parent = json.loads(kt._handle_create({
+            "title": "cron parent",
+            "assignee": "test-worker",
+        }))
+        child = json.loads(kt._handle_create({
+            "title": "cron child",
+            "assignee": "test-worker",
+        }))
+        linked = json.loads(kt._handle_link({
+            "parent_id": parent["task_id"],
+            "child_id": child["task_id"],
+        }))
+        listed = json.loads(kt._handle_list({"limit": 10}))
+
+    assert parent["ok"] is True
+    assert child["ok"] is True
+    assert linked["ok"] is True
+    assert {parent["task_id"], child["task_id"]}.issubset(
+        {task["id"] for task in listed["tasks"]}
+    )
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

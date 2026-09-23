@@ -131,6 +131,12 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
   }
 
   if (kind === 'gave_up') {
+    if (payload?.trigger_outcome === 'stalled') {
+      return t('notify.progressStallBody')
+    }
+    if (payload?.empty_timeout === true) {
+      return t('notify.emptyTimeoutBody')
+    }
     return t('notify.gaveUpBody')
   }
 
@@ -139,7 +145,9 @@ function bodyFor(kind: string, ev: CompletionEvent): string {
 
 /** Raw machine text that must never be the toast body — surfaced muted in `detail`. */
 function rawErrorFor(kind: string, ev: CompletionEvent): string {
-  return kind === 'gave_up' ? trimmed(ev.payload?.error) : ''
+  return kind === 'gave_up' && ev.payload?.empty_timeout !== true && ev.payload?.trigger_outcome !== 'stalled'
+    ? trimmed(ev.payload?.error)
+    : ''
 }
 
 function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
@@ -161,10 +169,14 @@ function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, e
         : ''
 
   const detail = [taskId, artifactText, rawErrorFor(kind, ev)].filter(Boolean).join(' · ')
-  const title = t(spec.titleKey)
+  const stoppedWithoutProgress =
+    (kind === 'gave_up' && ev.payload?.empty_timeout === true) ||
+    (kind === 'gave_up' && ev.payload?.trigger_outcome === 'stalled') ||
+    (kind === 'timed_out' && ev.payload?.empty_run === true)
+  const title = stoppedWithoutProgress ? t('notify.gaveUpTitle') : t(spec.titleKey)
   const message = body || taskId || title
   host.notify({
-    kind: spec.toast,
+    kind: stoppedWithoutProgress ? 'warning' : spec.toast,
     title,
     message,
     ...(detail ? { detail } : {}),
