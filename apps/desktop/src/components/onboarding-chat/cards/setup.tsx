@@ -5,7 +5,6 @@
  */
 
 import { useStore } from '@nanostores/react'
-import { Puzzle } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
@@ -25,6 +24,7 @@ import { ConnectorLogo } from '@/components/ui/connector-logo'
 import { SearchField } from '@/components/ui/search-field'
 import { registry } from '@/contrib/registry'
 import { connectorIconUrl, connectorTitle } from '@/lib/connector-tools'
+import { Package } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { type ConnectorCatalog, useConnectorCatalog } from '@/store/connector-catalog'
 import { $onboardingAnswers, setOnboardingAnswers } from '@/store/onboarding-answers'
@@ -135,7 +135,7 @@ export function ConnectorPicks({ catalog, commit, done, locked, plugins }: Conne
                 className={cn(pluginNeedsApp(plugin) && 'opacity-60')}
                 icon={
                   <span className="grid size-7 shrink-0 place-items-center rounded-full bg-background text-muted-foreground">
-                    <Puzzle className="size-4" />
+                    <Package className="size-4" />
                   </span>
                 }
                 key={`plugin:${plugin.name}`}

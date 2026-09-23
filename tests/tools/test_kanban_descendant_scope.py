@@ -132,6 +132,7 @@ def test_child_shell_can_write_a_kanban_board_outside_its_lineage_root(tmp_path,
         f"sys.path.insert(0, {str(ROOT)!r})\n"
         "from hermes_cli import kanban_db as kb\n"
         "from hermes_cli.kanban_db_connect import connect\n"
+        "from tools import kanban_tools as kt\n"
         "out = {'marker': os.environ.get('HERMES_DELEGATED_CHILD_CONTEXT')}\n"
         "try:\n"
         "    conn = connect(kb.kanban_db_path()); kb.create_task(conn, title='lineage'); out['lineage'] = 'WROTE'\n"
@@ -140,6 +141,7 @@ def test_child_shell_can_write_a_kanban_board_outside_its_lineage_root(tmp_path,
         f"os.environ['HERMES_HOME'] = {str(scratch_home)!r}\n"
         "import hermes_constants; hermes_constants._default_hermes_root_memo = None\n"
         "conn = connect(kb.kanban_db_path()); out['scratch'] = kb.create_task(conn, title='scratch')\n"
+        "out['scratch_tool'] = json.loads(kt._handle_create({'title':'scratch via tool', 'assignee':'scratch-worker'}))\n"
         "print('SCOPE_RESULT=' + json.dumps(out))\n"
     )
     with delegated_child_context("child-repro"):
@@ -153,6 +155,8 @@ def test_child_shell_can_write_a_kanban_board_outside_its_lineage_root(tmp_path,
     assert row["marker"] and row["marker"] != "1", row
     assert row["lineage"].startswith("fenced"), row
     assert row["scratch"], row
+    assert row["scratch_tool"]["ok"] is True, row
     scratch_conn = connect(scratch_home / "kanban.db")
     assert kb.get_task(scratch_conn, row["scratch"]).title == "scratch"
+    assert kb.get_task(scratch_conn, row["scratch_tool"]["task_id"]).title == "scratch via tool"
     scratch_conn.close()

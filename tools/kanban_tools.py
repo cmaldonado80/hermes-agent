@@ -177,13 +177,15 @@ def _kanban_handler(tool_name: str) -> Callable:
 
 
 def _reject_delegated_child_mutation(tool_name: str) -> None:
-    """Reject delegate descendants, which never receive board write authority.
+    """Reject in-process delegate children, which never receive board write authority.
 
     In-process cron jobs are different: the non-owner ContextVar suppresses the
     inherited worker identity, but a cron profile that explicitly enables the
     Kanban toolset remains an ordinary orchestrator and may use explicit ids.
+    Spawned delegate descendants are enforced by the path-aware database fence:
+    they may write a separate scratch board outside their lineage's board root.
     """
-    if _delegation_ctx("is_delegated_child_process_context", False):
+    if _is_delegated_child_context():
         raise _Reject(
             f"{tool_name} refused: delegate_task child agents do not have Kanban write authority. "
             "Return findings to the parent agent; the dispatcher worker or an explicitly configured "
