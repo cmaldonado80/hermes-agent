@@ -462,11 +462,23 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
     return _oauth_token_state(result, fallback_refresh_token=refresh_token)
 
 
+def _claude_code_grant_is_borrowed_off() -> bool:
+    """True when the owner has forbidden borrowing Claude Code's OAuth grant (2026-09-26 ruling:
+    one refresher per token — Claude Code is the sole owner of its grant). Checked before every
+    read/POST/write of the ``claude_code`` source's secrets; ``hermes_pkce`` (Hermes' own PKCE
+    grant) is unaffected. The env-var opt-out exists for emergencies the owner explicitly grants.
+    """
+    return os.environ.get("HERMES_ALLOW_CLAUDE_CODE_BORROW") != "1"
+
+
 def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     """Refresh an expired Claude Code OAuth token, returning the new access token. Refresh tokens are single-use and
     Claude Code refreshes on its own schedule, so we first re-read the live sources and adopt an already-rotated
     token instead of racing it into ``invalid_grant``. Read, decision, POST and write-back share the pool's
     path-keyed cross-process lock (else two profiles can spend one refresh token)."""
+    if _claude_code_grant_is_borrowed_off():
+        logger.debug("claude_code grant borrowing is OFF (owner ruling 2026-09-26) - no refresh POST")
+        return None
     try:
         from hermes_cli.auth import AUTH_LOCK_TIMEOUT_SECONDS, _auth_store_lock, env_float
         refresh_timeout_seconds = env_float("HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS", 20)
@@ -539,6 +551,11 @@ def _write_claude_code_credentials(
     """Commit refreshed credentials to ~/.claude/.credentials.json; ``CredentialPersistError`` on any failure (a
     corrupt existing file included). *scopes* (or the previously stored scopes) are persisted because Claude Code
     >=2.1.81 gates on ``"user:inference"`` being present."""
+    if _claude_code_grant_is_borrowed_off():
+        raise CredentialPersistError(
+            claude_code_credentials_path(),
+            RuntimeError("claude_code grant borrowing is OFF (owner ruling 2026-09-26) - refusing to write ~/.claude/.credentials.json"),
+        )
     cred_path = claude_code_credentials_path()
     try:
         existing = json.loads(cred_path.read_text(encoding="utf-8-sig")) if cred_path.exists() else {}
