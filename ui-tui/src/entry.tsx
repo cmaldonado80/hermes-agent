@@ -17,8 +17,11 @@ import { recordParentLifecycle } from './lib/parentLog.js'
 import { clearNativeTuiFrame, resetTerminalModes } from './lib/terminalModes.js'
 
 if (!process.stdin.isTTY) {
+  // Exit non-zero: `_launch_tui` propagates this code, and a 0 here made a piped
+  // `hermes chat --tui` (no query) look like a successful smoke run even though
+  // no model turn ever ran (2026-09-18 dead-provider false positive).
   console.log(messages().chatBits.entry.noTty)
-  process.exit(0)
+  process.exit(1)
 }
 
 // Start from a clean slate. If a previous TUI crashed or was kill -9'd, the

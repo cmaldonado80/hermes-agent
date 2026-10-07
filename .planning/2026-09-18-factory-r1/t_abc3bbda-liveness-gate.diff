@@ -1,0 +1,888 @@
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 1927ee07a1..42247bf907 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1815,6 +1815,12 @@ DEFAULT_CONFIG = {
+         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
+         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
+         "dispatch_stale_timeout_seconds": 14400,
++        # Probe the exact provider/model route before claiming a card so dead credentials,
++        # unsupported models and unreachable endpoints do not start retry spirals.
++        "dispatch_liveness_gate": True,
++        "dispatch_liveness_timeout_seconds": 8,
++        "dispatch_liveness_alive_ttl_seconds": 300,
++        "dispatch_liveness_dead_ttl_seconds": 60,
+         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
+         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
+         # keeps orphans frozen for manual forensics.
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 03d7b1f271..b1ae335f06 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -232,7 +232,7 @@ _TICK_ACTIVITY_FIELDS = (
+     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
+     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
+-    "skipped_nonspawnable",
++    "skipped_nonspawnable", "liveness_blocked",
+ )
+ 
+ 
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index bb1fd93186..e7887534fb 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -132,6 +132,8 @@ class DispatchResult:
+     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
+     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
+     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
++    liveness_blocked: list[tuple[str, str, str]] = field(default_factory=list)
++    """``(task_id, provider/model, error)`` routes rejected before claim."""
+     rate_limited: list[str] = field(default_factory=list)
+     """Task ids whose workers bailed on a provider rate-limit / quota wall
+     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
+@@ -162,6 +164,10 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
+             continue
+         for _task_id, reason in res.respawn_guarded:
+             counts[reason] = counts.get(reason, 0) + 1
++        if res.liveness_blocked:
++            counts["liveness_blocked"] = (
++                counts.get("liveness_blocked", 0) + len(res.liveness_blocked)
++            )
+         if res.rate_limited:
+             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+         if res.skipped_locked:
+@@ -1861,6 +1867,41 @@ def _dispatch_lane_task(
+                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+         return False
+ 
++    if not dry_run:
++        try:
++            from hermes_cli import kanban_dispatch_liveness as _liveness
++
++            gate_enabled = _liveness.liveness_gate_enabled()
++        except Exception:
++            gate_enabled = False
++            _kb._log.debug(
++                "kanban dispatch: liveness gate setup failed open for task %s",
++                task_id,
++                exc_info=True,
++            )
++        if gate_enabled:
++            try:
++                outcome = _liveness.probe_route(
++                    assignee, row["model_override"], row["provider_override"],
++                )
++            except Exception:
++                _kb._log.debug(
++                    "kanban dispatch: liveness probe failed open for task %s",
++                    task_id,
++                    exc_info=True,
++                )
++            else:
++                if not outcome.alive:
++                    route = f"{outcome.provider}/{outcome.model}"
++                    result.liveness_blocked.append((task_id, route, outcome.error))
++                    _record_liveness_block(
++                        conn,
++                        task_id,
++                        outcome,
++                        dead_ttl_seconds=_liveness.dead_ttl_seconds(),
++                    )
++                    return False
++
+     def _count_spawn(name: str) -> None:
+         # Later rows in this tick respect the per-profile cap; subsequent
+         # ticks re-query from the DB.
+@@ -1948,6 +1989,41 @@ def _apply_default_assignee(
+     return True
+ 
+ 
++def _record_liveness_block(
++    conn: sqlite3.Connection, task_id: str, outcome, *, dead_ttl_seconds: int,
++) -> None:
++    """Write one operator-visible note per cached dead episode."""
++    payload = {
++        "provider": outcome.provider,
++        "model": outcome.model,
++        "error": outcome.error,
++    }
++    previous = conn.execute(
++        "SELECT payload, created_at FROM task_events "
++        "WHERE task_id = ? AND kind = 'liveness_blocked' "
++        "ORDER BY id DESC LIMIT 1",
++        (task_id,),
++    ).fetchone()
++    if previous is not None:
++        try:
++            import json
++
++            same_error = json.loads(previous["payload"] or "null") == payload
++            within_dead_ttl = time.time() - previous["created_at"] <= dead_ttl_seconds
++            if same_error and within_dead_ttl:
++                return
++        except (TypeError, ValueError):
++            pass
++    body = (
++        f"Dispatch liveness gate: provider `{outcome.provider}` model `{outcome.model}` "
++        f"did not respond ({outcome.error}). Card left in ready; fix the provider/model "
++        "or credentials, then re-dispatch."
++    )
++    with _kb.write_txn(conn):
++        _kb.add_comment(conn, task_id, author="system", body=body)
++        _kb._append_event(conn, task_id, "liveness_blocked", payload)
++
++
+ def _run_reclaim_phase(
+     conn: sqlite3.Connection,
+     result: DispatchResult,
+@@ -2037,7 +2113,7 @@ def _tick_spawn_budget(
+ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
+     """Unclaimed rows of one lane in dispatch order."""
+     return conn.execute(
+-        "SELECT id, assignee FROM tasks "
++        "SELECT id, assignee, model_override, provider_override FROM tasks "
+         f"WHERE status = '{status}' AND claim_lock IS NULL "
+         "ORDER BY priority DESC, created_at ASC"
+     ).fetchall()
+diff --git a/tests/conftest.py b/tests/conftest.py
+index f020209ef8..99b715cf3a 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -616,6 +616,18 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
+     monkeypatch.setattr(_kbd_mod, "_system_memory_sample", lambda: {}, raising=False)
+ 
+ 
++@pytest.fixture(autouse=True)
++def _neutralize_kanban_liveness_gate(request, monkeypatch):
++    """Keep unrelated dispatcher tests from making live provider requests."""
++    if request.node.get_closest_marker("real_kanban_liveness_gate"):
++        return
++    try:
++        from hermes_cli import kanban_dispatch_liveness as _liveness
++    except Exception:
++        return
++    monkeypatch.setattr(_liveness, "liveness_gate_enabled", lambda: False)
++
++
+ @pytest.fixture(autouse=True)
+ def _neutralize_git_safe_directory_read(request, monkeypatch):
+     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.
+@@ -1316,6 +1328,10 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
+         "dispatcher's memory guard to 'no data' — only for tests that "
+         "exercise the guard itself with their own patched samples.",
+     )
++    config.addinivalue_line(
++        "markers",
++        "real_kanban_liveness_gate: exercise the dispatch-time provider liveness gate.",
++    )
+     # NOTE: linux_only / macos_only / windows_only are declared in
+     # pyproject.toml's ``markers`` list, not here — they are part of the
+     # project's public marker vocabulary (``pytest --markers``, and the CI
+diff --git a/tests/hermes_cli/test_kanban_default_assignee.py b/tests/hermes_cli/test_kanban_default_assignee.py
+index a56324c026..22a3e73acb 100644
+--- a/tests/hermes_cli/test_kanban_default_assignee.py
++++ b/tests/hermes_cli/test_kanban_default_assignee.py
+@@ -19,6 +19,8 @@ def isolated_kanban_home(monkeypatch):
+     """Spin up a fresh HERMES_HOME with a clean kanban DB."""
+     test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
+     monkeypatch.setenv("HERMES_HOME", test_home)
++    with open(os.path.join(test_home, "config.yaml"), "w", encoding="utf-8") as config_file:
++        config_file.write("kanban:\n  dispatch_liveness_gate: false\n")
+     # Force-reimport so the fresh HERMES_HOME is picked up.
+     for mod in list(sys.modules.keys()):
+         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+@@ -96,4 +98,3 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
+     assert task_id not in res.auto_assigned_default
+     assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
+ 
+-
+diff --git a/tests/hermes_cli/test_kanban_per_profile_cap.py b/tests/hermes_cli/test_kanban_per_profile_cap.py
+index 2741f6b34c..5beb42252b 100644
+--- a/tests/hermes_cli/test_kanban_per_profile_cap.py
++++ b/tests/hermes_cli/test_kanban_per_profile_cap.py
+@@ -21,7 +21,9 @@ def isolated_kanban_home_with_profiles(monkeypatch):
+     for prof in ("alpha", "beta", "default"):
+         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
+         with open(os.path.join(test_home, "profiles", prof, "config.yaml"), "w") as fh:
+-            fh.write("{}\n")  # identity marker: a bare dir is not a profile
++            fh.write("kanban:\n  dispatch_liveness_gate: false\n")
++    with open(os.path.join(test_home, "config.yaml"), "w", encoding="utf-8") as fh:
++        fh.write("kanban:\n  dispatch_liveness_gate: false\n")
+     monkeypatch.setenv("HERMES_HOME", test_home)
+     for mod in list(sys.modules.keys()):
+         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+@@ -102,5 +104,3 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
+     assert len(res2.spawned) == 1
+     assert len(res2.skipped_per_profile_capped) == 1
+     assert res2.spawned[0][0] != spawned_id  # different task this time
+-
+-
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 203a194dda..dcf9fa5fc1 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -915,6 +915,10 @@ All commands are also available as a slash command in the interactive CLI and in
+ | `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
+ | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+ | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When set, this home's dispatcher only claims cards whose assignee is listed (fail-closed; an empty list claims nothing); other assignees land in `skipped_nonspawnable`. See [Shared boards across homes](#shared-boards-across-homes). |
++| `kanban.dispatch_liveness_gate` | `true` | Probes a card's pinned provider/model (or its assignee profile's default route) before claim; dead routes leave the card ready and let the tick continue. |
++| `kanban.dispatch_liveness_timeout_seconds` | `8` | Maximum seconds allowed for the dispatch-time one-token liveness request. |
++| `kanban.dispatch_liveness_alive_ttl_seconds` | `300` | How long a healthy profile/provider/model probe is reused in-process. |
++| `kanban.dispatch_liveness_dead_ttl_seconds` | `60` | How long a dead-route result is reused before checking for recovery. |
+ | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
+ | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
+ 
+diff --git a/hermes_cli/kanban_dispatch_liveness.py b/hermes_cli/kanban_dispatch_liveness.py
+new file mode 100644
+index 0000000000..ff4c3a1083
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_liveness.py
+@@ -0,0 +1,323 @@
++"""Dispatch-time liveness probe for a Kanban card's pinned model route."""
++
++from __future__ import annotations
++
++import contextvars
++import queue
++import threading
++import time
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Optional
++
++
++DEFAULT_TIMEOUT_SECONDS = 8
++DEFAULT_ALIVE_TTL_SECONDS = 300
++DEFAULT_DEAD_TTL_SECONDS = 60
++
++
++@dataclass(frozen=True)
++class ProbeOutcome:
++    alive: bool
++    provider: str
++    model: str
++    error: str
++
++
++@dataclass(frozen=True)
++class _LivenessSettings:
++    timeout_seconds: int
++    alive_ttl_seconds: int
++    dead_ttl_seconds: int
++
++
++class _ProbeRequestTimeout(TimeoutError):
++    pass
++
++
++_probe_cache: dict[tuple[str, str, str], tuple[float, ProbeOutcome]] = {}
++_probe_cache_lock = threading.Lock()
++
++
++def _positive_int(value: Any, default: int) -> int:
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError):
++        return default
++    return parsed if parsed > 0 else default
++
++
++def _kanban_config() -> dict[str, Any]:
++    from hermes_cli.config import load_config_readonly
++
++    section = (load_config_readonly() or {}).get("kanban")
++    return section if isinstance(section, dict) else {}
++
++
++def liveness_gate_enabled() -> bool:
++    """Whether dispatch probes are enabled; config failures fail open to enabled."""
++    try:
++        return bool(_kanban_config().get("dispatch_liveness_gate", True))
++    except Exception:
++        return True
++
++
++def _settings() -> _LivenessSettings:
++    try:
++        config = _kanban_config()
++    except Exception:
++        config = {}
++    return _LivenessSettings(
++        timeout_seconds=_positive_int(
++            config.get("dispatch_liveness_timeout_seconds"), DEFAULT_TIMEOUT_SECONDS,
++        ),
++        alive_ttl_seconds=_positive_int(
++            config.get("dispatch_liveness_alive_ttl_seconds"), DEFAULT_ALIVE_TTL_SECONDS,
++        ),
++        dead_ttl_seconds=_positive_int(
++            config.get("dispatch_liveness_dead_ttl_seconds"), DEFAULT_DEAD_TTL_SECONDS,
++        ),
++    )
++
++
++def dead_ttl_seconds() -> int:
++    """Configured dead-result TTL, shared with dispatcher comment deduplication."""
++    return _settings().dead_ttl_seconds
++
++
++def _configured_model(config: dict[str, Any]) -> str:
++    raw = config.get("model")
++    if isinstance(raw, str):
++        return raw.strip()
++    if not isinstance(raw, dict):
++        return ""
++    selected = raw.get("default") or raw.get("model") or raw.get("name") or ""
++    if isinstance(selected, dict):
++        selected = selected.get("model") or selected.get("name") or selected.get("id") or ""
++    return str(selected).strip()
++
++
++def _configured_provider(config: dict[str, Any]) -> str:
++    raw = config.get("model")
++    if not isinstance(raw, dict):
++        return ""
++    selected = raw.get("provider") or ""
++    if not selected and isinstance(raw.get("default"), dict):
++        selected = raw["default"].get("provider") or ""
++    return str(selected).strip()
++
++
++def _status_code(exc: BaseException) -> Optional[int]:
++    raw = getattr(exc, "status_code", None)
++    if raw is None:
++        raw = getattr(getattr(exc, "response", None), "status_code", None)
++    try:
++        return int(raw) if raw is not None else None
++    except (TypeError, ValueError):
++        return None
++
++
++def _error_text(exc: BaseException) -> str:
++    message = str(exc).strip() or type(exc).__name__
++    body = getattr(exc, "body", None)
++    if isinstance(body, dict):
++        nested = body.get("error")
++        detail = nested.get("message") if isinstance(nested, dict) else body.get("message")
++        if detail and str(detail) not in message:
++            message = f"{message}: {detail}"
++    status = _status_code(exc)
++    if status is not None and str(status) not in message:
++        message = f"{status} {message}"
++    try:
++        from agent.redact import redact_for_egress
++
++        return redact_for_egress(message)
++    except Exception:
++        return type(exc).__name__
++
++
++def classify_probe_error(exc: BaseException) -> Optional[str]:
++    """Return safe dead-route evidence, or ``None`` for an unexpected failure."""
++    status = _status_code(exc)
++    message = str(exc).lower()
++    error_type = type(exc).__name__.lower()
++    if status in {401, 402, 403, 404, 429}:
++        return _error_text(exc)
++    if "model" in message and "not" in message and (
++        "found" in message or "support" in message
++    ):
++        return _error_text(exc)
++    if isinstance(exc, (TimeoutError, ConnectionError)):
++        return _error_text(exc)
++    if any(token in error_type for token in (
++        "timeout", "connection", "connecterror", "networkerror", "protocolerror",
++        "ratelimit", "sslerror", "dnserror", "authenticationerror",
++        "permissiondenied", "unauthorized", "forbidden",
++    )):
++        return _error_text(exc)
++    if any(token in message for token in (
++        "timed out", "connection refused", "connection reset", "connection error",
++        "name or service not known", "no route to host", "network is unreachable",
++        "rate limit", "rate_limit", "quota exceeded", "quota exhausted",
++        "payment required", "insufficient credits",
++        "server disconnected", "peer closed connection", "unexpected eof",
++    )):
++        return _error_text(exc)
++    try:
++        from hermes_cli.auth import AuthError
++
++        if isinstance(exc, AuthError):
++            return _error_text(exc)
++    except Exception:
++        pass
++    return None
++
++
++def _cache_get(key: tuple[str, str, str]) -> Optional[ProbeOutcome]:
++    now = time.monotonic()
++    with _probe_cache_lock:
++        entry = _probe_cache.get(key)
++        if entry is None:
++            return None
++        expires_at, outcome = entry
++        if expires_at > now:
++            return outcome
++        _probe_cache.pop(key, None)
++    return None
++
++
++def _cache_put(
++    key: tuple[str, str, str], outcome: ProbeOutcome, settings: _LivenessSettings,
++) -> ProbeOutcome:
++    ttl = settings.alive_ttl_seconds if outcome.alive else settings.dead_ttl_seconds
++    with _probe_cache_lock:
++        _probe_cache[key] = (time.monotonic() + ttl, outcome)
++    return outcome
++
++
++def _single_request(client: Any, model: str, timeout_seconds: int) -> None:
++    """Issue one request and bound adapters that do not forward per-call timeouts."""
++    results: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
++    context = contextvars.copy_context()
++
++    def _request() -> None:
++        try:
++            response = client.chat.completions.create(
++                model=model,
++                messages=[{"role": "user", "content": "ping"}],
++                max_tokens=1,
++                timeout=timeout_seconds,
++            )
++            results.put((True, response))
++        except Exception as exc:
++            results.put((False, exc))
++
++    thread = threading.Thread(
++        target=lambda: context.run(_request),
++        name="kanban-route-liveness",
++        daemon=True,
++    )
++    thread.start()
++    try:
++        ok, value = results.get(timeout=timeout_seconds)
++    except queue.Empty as exc:
++        raise _ProbeRequestTimeout(
++            f"request timed out after {timeout_seconds}s"
++        ) from exc
++    if not ok:
++        raise value
++
++
++def _profile_scope(profile: str) -> tuple[str, Optional[str]]:
++    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
++
++    profile_name = normalize_profile_name(profile)
++    try:
++        profile_home = resolve_profile_env(profile_name)
++    except FileNotFoundError:
++        profile_home = None
++    return profile_name, profile_home
++
++
++def probe_route(
++    profile: str,
++    model_override: Optional[str],
++    provider_override: Optional[str],
++) -> ProbeOutcome:
++    """Probe exactly the route a dispatched worker would use.
++
++    Recognized route failures are cached and returned dead. Any unexpected
++    probe-infrastructure failure is recorded but fails open.
++    """
++    settings = _settings()
++    provider_label = (provider_override or "auto").strip() or "auto"
++    model_label = (model_override or "").strip()
++    cache_key: Optional[tuple[str, str, str]] = None
++    home_token = secret_token = None
++    try:
++        profile_name, profile_home = _profile_scope(profile)
++        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++        if profile_home:
++            home_token = set_hermes_home_override(profile_home)
++            from agent.secret_scope import (
++                build_profile_secret_scope,
++                reset_secret_scope,
++                set_secret_scope,
++            )
++
++            secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
++        from hermes_cli.config import load_config_readonly
++        from hermes_cli.runtime_provider import resolve_runtime_provider
++
++        config = load_config_readonly() or {}
++        model_label = model_label or _configured_model(config)
++        if not provider_override:
++            provider_label = _configured_provider(config) or provider_label
++        runtime = resolve_runtime_provider(
++            requested=provider_override or None,
++            target_model=model_override or None,
++        )
++        provider_label = str(runtime.get("provider") or provider_label)
++        cache_key = (profile_name, provider_label, model_label)
++        cached = _cache_get(cache_key)
++        if cached is not None:
++            return cached
++
++        from agent.auxiliary_client import resolve_provider_client
++
++        client, resolved_model = resolve_provider_client(
++            provider_label,
++            model=model_label,
++            explicit_base_url=str(runtime.get("base_url") or ""),
++            explicit_api_key=runtime.get("api_key") or None,
++            api_mode=str(runtime.get("api_mode") or ""),
++            main_runtime={**runtime, "model": model_label},
++        )
++        model_label = str(resolved_model or model_label or "(default)")
++        if client is None or not resolved_model:
++            raise RuntimeError(
++                "provider client unavailable (credentials or model route not configured)"
++            )
++        _single_request(client, model_label, settings.timeout_seconds)
++        return _cache_put(
++            cache_key,
++            ProbeOutcome(True, provider_label, model_label, ""),
++            settings,
++        )
++    except Exception as exc:
++        error = classify_probe_error(exc)
++        outcome = ProbeOutcome(
++            error is None,
++            provider_label,
++            model_label or "(default)",
++            error or _error_text(exc),
++        )
++        if cache_key is None:
++            cache_key = (str(profile), provider_label, model_label)
++        return _cache_put(cache_key, outcome, settings)
++    finally:
++        if secret_token is not None:
++            reset_secret_scope(secret_token)
++        if home_token is not None:
++            reset_hermes_home_override(home_token)
+diff --git a/tests/hermes_cli/test_kanban_dispatch_liveness.py b/tests/hermes_cli/test_kanban_dispatch_liveness.py
+new file mode 100644
+index 0000000000..8da7c7f1f4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_liveness.py
+@@ -0,0 +1,318 @@
++"""Dispatch-time provider liveness gate contracts."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++
++
++pytestmark = pytest.mark.real_kanban_liveness_gate
++
++
++@pytest.fixture()
++def kanban_home():
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import kanban_dispatch_liveness as liveness
++
++    liveness._probe_cache.clear()
++    with kbc.connect_closing() as conn:
++        kb.create_board(slug="default", name="Liveness test")
++    return kb, kbc, kbd, liveness
++
++
++def _fake_spawn(*_args, **_kwargs):
++    return 12345
++
++
++def _create_task(kb, kbc, *, title="task", model="test-model", provider="test-provider"):
++    with kbc.connect_closing() as conn:
++        return kb.create_task(
++            conn,
++            title=title,
++            assignee="default",
++            model_override=model,
++            provider_override=provider,
++        )
++
++
++def _dispatch(kbd, kbc):
++    with kbc.connect_closing() as conn:
++        return kbd.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
++
++
++def _patch_gate(monkeypatch, liveness, probe):
++    monkeypatch.setattr(liveness, "liveness_gate_enabled", lambda: True)
++    monkeypatch.setattr(liveness, "probe_route", probe)
++
++
++def test_dead_route_stays_ready_with_comment_event_and_telemetry(
++    kanban_home, monkeypatch,
++):
++    kb, kbc, kbd, liveness = kanban_home
++    task_id = _create_task(kb, kbc)
++    outcome = liveness.ProbeOutcome(
++        False, "test-provider", "test-model", "401 invalid api key",
++    )
++    _patch_gate(monkeypatch, liveness, lambda *_args: outcome)
++
++    result = _dispatch(kbd, kbc)
++
++    assert result.spawned == []
++    assert result.liveness_blocked == [
++        (task_id, "test-provider/test-model", "401 invalid api key"),
++    ]
++    assert "liveness_blocked=1" in kbd.describe_suppression([result])
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, task_id)
++        comments = kb.list_comments(conn, task_id)
++        events = [event for event in kb.list_events(conn, task_id) if event.kind == "liveness_blocked"]
++    assert task is not None
++    assert task.status == "ready"
++    assert task.claim_lock is None
++    assert len(comments) == 1
++    assert comments[0].author == "system"
++    assert "provider `test-provider` model `test-model`" in comments[0].body
++    assert "401 invalid api key" in comments[0].body
++    assert len(events) == 1
++    assert events[0].payload == {
++        "provider": "test-provider",
++        "model": "test-model",
++        "error": "401 invalid api key",
++    }
++
++
++def test_dead_route_does_not_block_next_card_same_tick(kanban_home, monkeypatch):
++    kb, kbc, kbd, liveness = kanban_home
++    dead_id = _create_task(kb, kbc, title="dead", model="dead-model")
++    live_id = _create_task(kb, kbc, title="live", model="live-model")
++
++    def _probe(_profile, model, provider):
++        return liveness.ProbeOutcome(
++            model != "dead-model",
++            provider,
++            model,
++            "404 model not found" if model == "dead-model" else "",
++        )
++
++    _patch_gate(monkeypatch, liveness, _probe)
++    result = _dispatch(kbd, kbc)
++
++    assert [task_id for task_id, _assignee, _workspace in result.spawned] == [live_id]
++    assert [entry[0] for entry in result.liveness_blocked] == [dead_id]
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, dead_id).status == "ready"
++        assert kb.get_task(conn, live_id).status == "running"
++
++
++def test_alive_route_spawns_and_claims_normally(kanban_home, monkeypatch):
++    kb, kbc, kbd, liveness = kanban_home
++    task_id = _create_task(kb, kbc)
++    _patch_gate(
++        monkeypatch,
++        liveness,
++        lambda *_args: liveness.ProbeOutcome(True, "test-provider", "test-model", ""),
++    )
++
++    result = _dispatch(kbd, kbc)
++
++    assert [entry[0] for entry in result.spawned] == [task_id]
++    assert result.liveness_blocked == []
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, task_id)
++    assert task.status == "running"
++    assert task.claim_lock is not None
++
++
++def test_timeout_route_stays_ready(kanban_home, monkeypatch):
++    kb, kbc, kbd, liveness = kanban_home
++    task_id = _create_task(kb, kbc)
++    _patch_gate(
++        monkeypatch,
++        liveness,
++        lambda *_args: liveness.ProbeOutcome(
++            False, "test-provider", "test-model", "request timed out after 8s",
++        ),
++    )
++
++    result = _dispatch(kbd, kbc)
++
++    assert result.spawned == []
++    assert result.liveness_blocked[0][2] == "request timed out after 8s"
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, task_id).status == "ready"
++
++
++def test_unexpected_probe_failure_fails_open(kanban_home, monkeypatch):
++    kb, kbc, kbd, liveness = kanban_home
++    task_id = _create_task(kb, kbc)
++
++    def _raise(*_args):
++        raise RuntimeError("probe implementation broke")
++
++    _patch_gate(monkeypatch, liveness, _raise)
++    result = _dispatch(kbd, kbc)
++
++    assert [entry[0] for entry in result.spawned] == [task_id]
++
++
++def test_gate_off_does_not_call_probe(kanban_home, monkeypatch):
++    kb, kbc, kbd, liveness = kanban_home
++    task_id = _create_task(kb, kbc)
++    from hermes_constants import get_hermes_home
++
++    (get_hermes_home() / "config.yaml").write_text(
++        "kanban:\n  dispatch_liveness_gate: false\n",
++        encoding="utf-8",
++    )
++
++    def _unexpected(*_args):
++        pytest.fail("probe_route must not be called when the gate is disabled")
++
++    monkeypatch.setattr(liveness, "probe_route", _unexpected)
++    result = _dispatch(kbd, kbc)
++
++    assert [entry[0] for entry in result.spawned] == [task_id]
++
++
++def test_probe_cache_reuses_live_route_for_two_cards(kanban_home, monkeypatch):
++    kb, kbc, kbd, liveness = kanban_home
++    first_id = _create_task(kb, kbc, title="first")
++    second_id = _create_task(kb, kbc, title="second")
++    from agent import auxiliary_client
++    from hermes_cli import runtime_provider
++
++    monkeypatch.setattr(
++        runtime_provider,
++        "resolve_runtime_provider",
++        lambda **_kwargs: {
++            "provider": "test-provider",
++            "base_url": "https://provider.invalid/v1",
++            "api_key": "test-placeholder",
++            "api_mode": "chat_completions",
++        },
++    )
++    monkeypatch.setattr(
++        auxiliary_client,
++        "resolve_provider_client",
++        lambda *_args, **_kwargs: (SimpleNamespace(), "test-model"),
++    )
++    calls = []
++    monkeypatch.setattr(
++        liveness,
++        "_single_request",
++        lambda _client, model, timeout: calls.append((model, timeout)),
++    )
++
++    result = _dispatch(kbd, kbc)
++
++    assert {entry[0] for entry in result.spawned} == {first_id, second_id}
++    assert calls == [("test-model", 8)]
++
++
++def test_probe_uses_profile_default_route_without_card_override(
++    kanban_home, monkeypatch,
++):
++    _kb, _kbc, _kbd, liveness = kanban_home
++    from agent import auxiliary_client
++    from hermes_cli import runtime_provider
++    from hermes_constants import get_hermes_home
++
++    (get_hermes_home() / "config.yaml").write_text(
++        "model:\n  provider: profile-provider\n  default: profile-model\n",
++        encoding="utf-8",
++    )
++    resolved = []
++
++    def _resolve_runtime(**kwargs):
++        resolved.append(kwargs)
++        return {
++            "provider": "profile-provider",
++            "base_url": "https://provider.invalid/v1",
++            "api_key": "test-placeholder",
++            "api_mode": "chat_completions",
++        }
++
++    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", _resolve_runtime)
++    monkeypatch.setattr(
++        auxiliary_client,
++        "resolve_provider_client",
++        lambda provider, **kwargs: (
++            SimpleNamespace(),
++            kwargs["model"] if provider == "profile-provider" else None,
++        ),
++    )
++    requests = []
++    monkeypatch.setattr(
++        liveness,
++        "_single_request",
++        lambda _client, model, timeout: requests.append((model, timeout)),
++    )
++
++    outcome = liveness.probe_route("default", None, None)
++
++    assert outcome == liveness.ProbeOutcome(
++        True, "profile-provider", "profile-model", "",
++    )
++    assert resolved == [{"requested": None, "target_model": None}]
++    assert requests == [("profile-model", 8)]
++
++
++def test_identical_dead_episode_does_not_repeat_comment_or_event(
++    kanban_home, monkeypatch,
++):
++    kb, kbc, kbd, liveness = kanban_home
++    task_id = _create_task(kb, kbc)
++    outcome = liveness.ProbeOutcome(
++        False, "test-provider", "test-model", "429 quota exhausted",
++    )
++    _patch_gate(monkeypatch, liveness, lambda *_args: outcome)
++
++    _dispatch(kbd, kbc)
++    _dispatch(kbd, kbc)
++
++    with kbc.connect_closing() as conn:
++        comments = kb.list_comments(conn, task_id)
++        events = [event for event in kb.list_events(conn, task_id) if event.kind == "liveness_blocked"]
++    assert len(comments) == 1
++    assert len(events) == 1
++
++
++@pytest.mark.parametrize(
++    ("exc", "expected"),
++    [
++        (TimeoutError("request timed out after 8s"), "request timed out after 8s"),
++        (ConnectionError("connection refused"), "connection refused"),
++        (RuntimeError("model abc not supported"), "model abc not supported"),
++        (RuntimeError("internal probe bug"), None),
++    ],
++)
++def test_classify_probe_error(exc, expected):
++    from hermes_cli.kanban_dispatch_liveness import classify_probe_error
++
++    assert classify_probe_error(exc) == expected
++
++
++def test_classify_probe_error_includes_status_and_body_message():
++    from hermes_cli.kanban_dispatch_liveness import classify_probe_error
++
++    exc = RuntimeError("request failed")
++    exc.status_code = 401
++    exc.body = {"error": {"message": "invalid api key"}}
++
++    assert classify_probe_error(exc) == "401 request failed: invalid api key"
++
++
++def test_classify_missing_credentials_as_dead_route():
++    from hermes_cli.auth import AuthError
++    from hermes_cli.kanban_dispatch_liveness import classify_probe_error
++
++    exc = AuthError(
++        "No usable credentials found",
++        provider="test-provider",
++        code="missing_api_key",
++    )
++
++    assert classify_probe_error(exc) == "No usable credentials found"

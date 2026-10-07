@@ -113,7 +113,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "paused": res.paused,
         }, ascii=True)
+        return 0
+    if res.paused:
+        print("Paused:       emergency stop engaged, nothing dispatched (run `hermes resume`)")
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
     if res.reaped_terminal_workers:

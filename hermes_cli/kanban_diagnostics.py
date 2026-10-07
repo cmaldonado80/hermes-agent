@@ -112,18 +112,6 @@ def _latest_event_ts(events: Iterable[Any], kinds: set[str]) -> int:
     return max([0, *(_event_ts(ev) for ev in events if _event_kind(ev) in kinds)])
 
 
-def _latest_gave_up_is_terminal_provider(events: Iterable[Any]) -> bool:
-    """True when the most recent breaker trip was a terminal provider error (credential
-    revoked, model gone) and nothing has resumed the task since."""
-    for ev in reversed(list(events)):
-        kind = _event_kind(ev)
-        if kind == "gave_up":
-            return bool(_parse_payload(ev).get("terminal_provider"))
-        if kind in {"unblocked", "promoted", "completed", "claimed"}:
-            return False
-    return False
-
-
 def _cli_hint(label: str, command: str, *, suggested: bool = False) -> DiagnosticAction:
     return DiagnosticAction(kind="cli_hint", label=label, payload={"command": command},
                             suggested=suggested)
@@ -381,12 +369,8 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     threshold = _positive_int(_failure_threshold(cfg), 3)
     failure_limit = _positive_int(cfg.get("failure_limit"), threshold)
     failures = _first_field(task, "consecutive_failures", "spawn_failures", 0)
-    # A terminal provider error (credential revoked, model gone) blocks the card after ONE
-    # attempt, below any threshold; it still needs an operator, so diagnose it now.
-    terminal_trip = _latest_gave_up_is_terminal_provider(events)
-    if not terminal_trip and (failures is None or failures < threshold):
+    if failures is None or failures < threshold:
         return []
-    failures = failures or 0
     last_err = _first_field(task, "last_failure_error", "last_spawn_error")
     assignee = _task_field(task, "assignee")
 
@@ -413,15 +397,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     severity = "critical" if failures >= threshold * 2 else "error"
     err_snippet = _error_snippet(last_err)
     outcome_label = _OUTCOME_LABELS.get(most_recent_outcome or "", "failure")
-    if terminal_trip:
-        title = "Provider rejected this profile's credential or model — blocked after one attempt"
-        detail = (
-            f"The worker's provider call failed with an error a retry cannot fix (revoked or invalid "
-            f"API key, model not found), so the dispatcher blocked the task instead of spending the "
-            f"{failure_limit}-attempt retry budget on it. Full last error:\n\n{err_snippet}\n\n"
-            f"Fix the assignee profile's provider credentials/model, then unblock the task."
-        )
-    elif err_snippet:
+    if err_snippet:
         title = f"Agent {outcome_label} x{failures}: {err_snippet.splitlines()[0][:160]}"
         detail = (
             f"This task has failed {failures} times in a row (most recent: {outcome_label}). Full "
@@ -557,40 +533,6 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     )]
 
 
-def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """A ``running`` card with a direct parent that is not ``done``/``archived``:
-    the dependency gate is not holding it (the parent reopened mid-run, or the
-    edge predates the running-child refusal) and ``kanban_complete`` will be
-    refused until the parents finish. Graph-aware; mutates nothing."""
-    if _task_field(task, "status") != "running":
-        return []
-    graph = cfg.get("_graph")
-    if not isinstance(graph, dict):
-        return []
-    open_parents = [
-        parent for parent in (graph.get("parents") or [])
-        if isinstance(parent, dict) and parent.get("id")
-        and parent.get("status") not in ("done", "archived")
-    ]
-    if not open_parents:
-        return []
-    task_id = str(_task_field(task, "id") or "")
-    parent_ids = [str(parent["id"]) for parent in open_parents]
-    seen_at = int(_task_field(task, "started_at", default=0) or 0) or now
-    return [Diagnostic(
-        kind="running_with_open_parents", severity="warning",
-        title=f"Running while {len(parent_ids)} parent(s) are not done",
-        detail="This card is running concurrently with a parent it declares a dependency on, so the "
-               "parent's work is not serialised ahead of it and completion will be refused until every "
-               "parent is done or archived. Finish the parent, or unlink the edge if it was never meant "
-               "to gate this run.",
-        actions=[_cli_hint("Unlink the parent that should not gate this run",
-                           f"hermes kanban unlink {parent_ids[0]} {task_id}")],
-        first_seen_at=seen_at, last_seen_at=now, count=len(parent_ids),
-        data={"open_parents": [{"id": p["id"], "status": p.get("status")} for p in open_parents]},
-    )]
-
-
 def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Blocked for >= cfg["blocked_stale_hours"] (default 24) with no comment
     or unblock since the last ``blocked`` event."""
@@ -679,6 +621,53 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _rule_triage_stuck(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A card sitting in ``triage`` with no revive since the latest
+    ``block_loop_detected`` — the machine parking column has an exit
+    (``hermes kanban revive``); surface it instead of letting operators
+    hand-copy a successor card. Age-gated by ``triage_stale_hours``
+    (default 24h) so a card routed seconds ago doesn't nag."""
+    if _task_field(task, "status") != "triage":
+        return []
+    latest_loop = next(
+        (ev for ev in reversed(list(events)) if _event_kind(ev) == "block_loop_detected"),
+        None,
+    )
+    if latest_loop is None:
+        # Parked at creation (--triage), not loop-routed: specify/decompose own it.
+        return []
+    revived_after = any(
+        _event_kind(ev) == "revived" and _event_ts(ev) >= _event_ts(latest_loop)
+        for ev in events
+    )
+    if revived_after:
+        return []
+
+    hours = float(cfg.get("triage_stale_hours", 24))
+    routed_at = _event_ts(latest_loop)
+    age_seconds = max(0, int(now) - routed_at)
+    if age_seconds < hours * 3600:
+        return []
+
+    task_id = _task_field(task, "id") or "<task_id>"
+    cmd = f"hermes kanban revive {task_id}"
+    actions = [
+        _cli_hint(f"Revive out of triage: {cmd}", cmd, suggested=True),
+        _cli_hint("Check block reasons first", f"hermes kanban show {task_id}"),
+    ]
+    return [Diagnostic(
+        kind="triage_stuck", severity="warning",
+        title=f"Task routed to triage {int(age_seconds / 3600)}h ago and still parked",
+        detail="The unblock-loop breaker routed this task to triage and it has not left since. "
+               "If the root cause (unfinished parent, missing input, dead model) is fixed, "
+               "revive it back into the work pool; otherwise a successor card just duplicates "
+               "the knowledge already on this one.",
+        actions=actions,
+        first_seen_at=routed_at, last_seen_at=int(now), count=1,
+        data={"task_id": task_id, "age_seconds": age_seconds, "routed_at": routed_at},
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Assigned, unclaimed, ``ready`` for >= cfg["stranded_threshold_seconds"]
     (default 30 min). Deliberately age-based and identity-agnostic so it
@@ -744,9 +733,9 @@ _RULES: list[RuleFn] = [
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_review_dependency_deadlock,
-    _rule_running_with_open_parents,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_triage_stuck,
     _rule_stranded_in_ready,
 ]
 
@@ -762,6 +751,9 @@ DEFAULT_CONFIG = {
     # Below 30 min the signal is dominated by tasks about to be claimed on
     # the next dispatcher tick.
     "stranded_threshold_seconds": 30 * 60,
+    # triage_stuck: how long a loop-routed card may sit in triage before the
+    # diagnostic nudges the operator toward `hermes kanban revive`.
+    "triage_stale_hours": 24,
 }
 
 
@@ -832,3 +824,23 @@ def compute_task_diagnostics(
     severity_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
     out.sort(key=lambda d: (-severity_idx.get(d.severity, -1), -(d.last_seen_at or 0)))
     return out
+
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# Names external plugins imported from this module before the Sep 2026 decomposition.
+# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
+# The whole block is removed by reverting the commit that added it.
+
+DIAGNOSTIC_KINDS = (
+    "hallucinated_cards",
+    "triage_aux_unavailable",
+    "prose_phantom_refs",
+    "repeated_failures",
+    "repeated_crashes",
+    "review_dependency_deadlock",
+    "stuck_in_blocked",
+    "block_unblock_cycling",
+    "triage_stuck",
+    "stranded_in_ready",
+)
+# ---- END PLUGIN-COMPAT ----
