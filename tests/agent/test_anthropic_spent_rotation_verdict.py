@@ -219,7 +219,12 @@ def test_independent_pool_credential_stays_eligible(
 def test_successful_commit_leaves_the_credential_usable(
     hermes_home, claude_credentials, monkeypatch
 ):
-    """Control: nothing is quarantined when the commit actually lands."""
+    """Control: nothing is quarantined when the commit actually lands.
+
+    The ruling's env opt-out is set so the POST + commit path executes; the
+    spent-rotation verdict machinery this file pins is ruling-independent.
+    """
+    monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
     monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _rotating_refresh)
 
     assert AA.resolve_anthropic_token() == _ROTATED_ACCESS
@@ -234,7 +239,13 @@ def test_successful_commit_leaves_the_credential_usable(
 def test_failed_commit_persists_the_verdict_to_the_sidecar(
     hermes_home, claude_credentials, monkeypatch
 ):
-    """The verdict must outlive this process: it lands in the sidecar file."""
+    """The verdict must outlive this process: it lands in the sidecar file.
+
+    The ruling's env opt-out is set so the POST + commit path executes (a
+    failed commit is only reachable when a rotation was attempted); the
+    sidecar-durability contract this test pins is ruling-independent.
+    """
+    monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
     monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _rotating_refresh)
     _break_durable_write(monkeypatch)
 
@@ -252,6 +263,29 @@ def test_failed_commit_persists_the_verdict_to_the_sidecar(
     raw = sidecar.read_text(encoding="utf-8")
     for secret in (_STALE_ACCESS, _STALE_REFRESH, _ROTATED_ACCESS, _ROTATED_REFRESH):
         assert secret not in raw
+
+
+def test_borrowing_off_never_spends_the_grant_or_writes_a_verdict(
+    hermes_home, claude_credentials, monkeypatch
+):
+    """Owner ruling 2026-09-26 (default path): no POST is ever attempted, so
+    there is no consumed rotation to record — no sidecar, no fingerprints,
+    and the shared file stays exactly as Claude Code left it."""
+    posts = []
+    monkeypatch.delenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", raising=False)
+    monkeypatch.setattr(
+        AA, "refresh_anthropic_oauth_pure",
+        lambda rt, **kw: posts.append(rt) or _rotating_refresh(rt, **kw),
+    )
+    _break_durable_write(monkeypatch)
+
+    assert AA._refresh_oauth_token(AA.read_claude_code_credentials()) is None
+
+    assert posts == [], f"the ruling forbids the refresh POST, got {posts}"
+    assert AA._SPENT_ROTATION_FINGERPRINTS == {}
+    assert not AA._spent_rotation_sidecar_path(claude_credentials).exists()
+    data = json.loads(claude_credentials.read_text(encoding="utf-8"))["claudeAiOauth"]
+    assert (data["accessToken"], data["refreshToken"]) == (_STALE_ACCESS, _STALE_REFRESH)
 
 
 _SECOND_PROCESS_WITNESS = r"""
@@ -308,6 +342,9 @@ def test_second_process_adopts_the_terminal_verdict(
     import sys
 
     # Process A: successful POST, failed durable commit.
+    # (env opt-out: a consumed-but-uncommitted rotation is only reachable when
+    # a rotation was attempted at all — the sidecar contract is what is pinned)
+    monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
     monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _rotating_refresh)
     _break_durable_write(monkeypatch)
     assert AA._refresh_oauth_token(AA.read_claude_code_credentials()) is None

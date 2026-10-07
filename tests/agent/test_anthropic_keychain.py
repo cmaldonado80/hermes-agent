@@ -215,7 +215,13 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
     def test_adopts_already_refreshed_token_without_posting(self, tmp_path, monkeypatch):
         """When a live source already holds a valid token, return it and skip
         the network refresh entirely.
+
+        The ruling's env opt-out is set so the refresher enters its body: the
+        adopt branch performs no POST and no write, so it stays within the
+        ruling even under the opt-out.  The default-off path is pinned in
+        ``test_borrowing_off_refuses_even_to_adopt`` below.
         """
+        monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
         monkeypatch.setattr(
             "agent.anthropic_credentials.claude_code_credentials_path",
             lambda: tmp_path / ".claude" / ".credentials.json",
@@ -242,6 +248,40 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
         # of the live, already-refreshed token.
         result = _refresh_oauth_token({"refreshToken": "stale", "expiresAt": 1})
         assert result == "already-refreshed-token"
+
+    def test_borrowing_off_refuses_even_to_adopt(self, tmp_path, monkeypatch):
+        """Owner ruling 2026-09-26 (default path): the refresher returns None
+        before any read/POST/write of the borrowed grant, so adopting Claude
+        Code's token is refused too — no POST, no write."""
+        monkeypatch.delenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", raising=False)
+        monkeypatch.setattr(
+            "agent.anthropic_credentials.claude_code_credentials_path",
+            lambda: tmp_path / ".claude" / ".credentials.json",
+        )
+        fresh = {
+            "accessToken": "already-refreshed-token",
+            "refreshToken": "live-refresh",
+            "expiresAt": self._FRESH,
+        }
+        monkeypatch.setattr(
+            "agent.anthropic_credentials.read_claude_code_credentials",
+            lambda: fresh,
+        )
+
+        posts, writes = [], []
+        monkeypatch.setattr(
+            "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+            lambda rt, **_kw: posts.append(rt),
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_credentials._write_claude_code_credentials",
+            lambda *a, **_kw: writes.append(a),
+        )
+
+        assert _refresh_oauth_token({"refreshToken": "stale", "expiresAt": 1}) is None
+        assert posts == [], f"borrowed grant was spent: {posts}"
+        assert writes == [], f"Claude Code's credentials were rewritten: {writes}"
+        assert not (tmp_path / ".claude" / ".credentials.json").exists()
 
     def test_never_posts_claude_codes_refresh_token(self, tmp_path, monkeypatch):
         """Claude Code owns this grant. Spending its single-use refresh token and committing the rotation to a

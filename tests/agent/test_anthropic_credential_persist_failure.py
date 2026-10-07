@@ -392,8 +392,11 @@ def test_retry_path_fails_closed_when_rotation_cannot_commit(
 
     ``_refresh_entry_impl`` is driven directly here: the pre-POST sync in
     ``_refresh_entry`` would adopt the newer file pair and return before ever
-    reaching this branch.
+    reaching this branch.  The ruling's env opt-out is set so the retry
+    branch (a claude_code-specific recovery path) is actually exercised;
+    the ruling-independent commit-ordering contract is what this test pins.
     """
+    monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
     posts: list[str] = []
 
     def _refresh(refresh_token, use_json=False):
@@ -437,3 +440,33 @@ def test_retry_path_fails_closed_when_rotation_cannot_commit(
         "sk-ant-oat01-winner",
         "sk-ant-ort01-winner",
     )
+
+
+def test_retry_path_refuses_before_any_post_when_borrowing_off(
+    hermes_home, claude_credentials, monkeypatch
+):
+    """Owner ruling 2026-09-26: with borrowing off (the default), the pool
+    refuses the refresh — and any retry of it — before the first POST.
+
+    ``_refresh_entry_impl`` is driven directly (as in the retry test above):
+    the pre-POST sync in ``_refresh_entry`` would adopt a newer file pair and
+    return before this branch, which is legitimate adoption, not a spend.
+    """
+    posts: list[str] = []
+
+    def _refresh(refresh_token, use_json=False):
+        posts.append(refresh_token)
+        return _rotating_refresh()
+
+    monkeypatch.delenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", raising=False)
+    monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _refresh)
+
+    entry = _entry("claude_code")
+    pool = CredentialPool("anthropic", [entry])
+
+    assert pool._refresh_entry_impl(entry, force=True) is None
+    assert posts == [], f"the ruling forbids any refresh POST, got {posts}"
+
+    quarantined = pool.entries()[0]
+    assert quarantined.last_status == STATUS_DEAD
+    assert _read_claude_pair(claude_credentials) == (_STALE_ACCESS, _STALE_REFRESH)

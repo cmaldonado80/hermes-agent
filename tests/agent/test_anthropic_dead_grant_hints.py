@@ -38,7 +38,14 @@ def test_dead_grant_is_classified_and_not_replayed_at_other_endpoints(monkeypatc
 
 def test_claude_code_refresher_reports_dead_grant_once_per_process(monkeypatch, caplog):
     """Later attempts with the same dead refresh token neither replay it at the endpoint nor re-warn; a rotated
-    (re-login) token is tried again."""
+    (re-login) token is tried again.
+
+    The ruling's env opt-out is set so the refresher actually reaches the POST:
+    this test pins the once-per-process dead-grant hint, which lives downstream
+    of the (ruling-gated) POST attempt.  The default-off path is pinned separately
+    below.
+    """
+    monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
     monkeypatch.setattr(ac, "_DEAD_REFRESH_TOKEN_FINGERPRINTS", set())
     monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: {"accessToken": "old", "refreshToken": "rt-dead", "expiresAt": 1})
     posts = []
@@ -58,6 +65,28 @@ def test_claude_code_refresher_reports_dead_grant_once_per_process(monkeypatch, 
     monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: {"accessToken": "old", "refreshToken": "rt-new", "expiresAt": 1})
     assert ac._refresh_oauth_token({"accessToken": "old", "refreshToken": "rt-new"}) is None
     assert posts == ["rt-dead", "rt-new"]
+
+
+def test_claude_code_refresher_never_posts_when_borrowing_off(monkeypatch, caplog):
+    """Owner ruling 2026-09-26 (default path): the refresher returns None before
+    any POST, so a dead grant can never be probed — and no dead-grant warning
+    fires — while borrowing is off."""
+    monkeypatch.delenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", raising=False)
+    monkeypatch.setattr(ac, "_DEAD_REFRESH_TOKEN_FINGERPRINTS", set())
+    monkeypatch.setattr(ac, "read_claude_code_credentials", lambda: {"accessToken": "old", "refreshToken": "rt-dead", "expiresAt": 1})
+    posts = []
+
+    def _must_not_post(refresh_token, *, use_json=False):
+        posts.append(refresh_token)
+        raise AssertionError("refresh POST attempted while borrowing is off")
+
+    monkeypatch.setattr(ac, "refresh_anthropic_oauth_pure", _must_not_post)
+    with caplog.at_level(logging.DEBUG, logger=ac.logger.name):
+        for _ in range(3):
+            assert ac._refresh_oauth_token({"accessToken": "old", "refreshToken": "rt-dead"}) is None
+
+    assert posts == []
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
 
 def test_claude_code_credentials_path_honours_claude_config_dir(monkeypatch, tmp_path):
     """The documented opt-out: CLAUDE_CONFIG_DIR relocates the borrowed file exactly as the Claude CLI does."""

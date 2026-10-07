@@ -10,7 +10,7 @@ import pytest
 
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.anthropic_adapter import build_anthropic_client, build_anthropic_kwargs
-from agent.anthropic_credentials import _is_oauth_token, _refresh_oauth_token, _write_claude_code_credentials, is_claude_code_token_valid, read_claude_code_credentials, resolve_anthropic_token, run_oauth_setup_token
+from agent.anthropic_credentials import CredentialPersistError, _is_oauth_token, _refresh_oauth_token, _write_claude_code_credentials, is_claude_code_token_valid, read_claude_code_credentials, resolve_anthropic_token, run_oauth_setup_token
 from agent.credential_pool import PooledCredential
 from agent.anthropic_message_convert import _to_plain_data, convert_messages_to_anthropic, convert_tools_to_anthropic, normalize_model_name
 from agent.transports import get_transport
@@ -424,6 +424,7 @@ class TestRefreshOauthToken:
 
 class TestWriteClaudeCodeCredentials:
     def test_writes_new_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
         monkeypatch.setattr("agent.anthropic_credentials.Path.home", lambda: tmp_path)
         _write_claude_code_credentials("tok", "ref", 12345)
         cred_file = tmp_path / ".claude" / ".credentials.json"
@@ -434,6 +435,7 @@ class TestWriteClaudeCodeCredentials:
         assert data["claudeAiOauth"]["expiresAt"] == 12345
 
     def test_preserves_existing_fields(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
         monkeypatch.setattr("agent.anthropic_credentials.Path.home", lambda: tmp_path)
         cred_dir = tmp_path / ".claude"
         cred_dir.mkdir()
@@ -454,6 +456,7 @@ class TestWriteClaudeCodeCredentials:
         the fix shipped in #19673 (google_oauth) and #21148 (mcp_oauth).
         """
         import stat as _stat
+        monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
         monkeypatch.setattr("agent.anthropic_credentials.Path.home", lambda: tmp_path)
         _write_claude_code_credentials("tok", "ref", 12345)
 
@@ -461,6 +464,17 @@ class TestWriteClaudeCodeCredentials:
         assert cred_file.exists()
         mode = _stat.S_IMODE(cred_file.stat().st_mode)
         assert mode == 0o600, f"creds file mode {oct(mode)} != 0o600 — TOCTOU race regressed"
+
+    def test_refuses_to_write_when_borrowing_off(self, tmp_path, monkeypatch):
+        """Owner ruling 2026-09-26: by default Hermes must not write Claude Code's
+        credential file at all — the write fails closed before touching disk."""
+        monkeypatch.delenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", raising=False)
+        monkeypatch.setattr("agent.anthropic_credentials.Path.home", lambda: tmp_path)
+
+        with pytest.raises(CredentialPersistError):
+            _write_claude_code_credentials("tok", "ref", 12345)
+
+        assert not (tmp_path / ".claude" / ".credentials.json").exists()
 
 
 class TestResolveWithRefresh:

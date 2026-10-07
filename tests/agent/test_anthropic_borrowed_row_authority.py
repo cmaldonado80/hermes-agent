@@ -51,6 +51,19 @@ _ROTATED_ACCESS = "sk-ant-oat01-borrowed-rotated"
 _ROTATED_REFRESH = "sk-ant-ort01-borrowed-rotated"
 
 
+@pytest.fixture(autouse=True)
+def _clean_spent_registry():
+    """The consumed-rotation registry is process-global; isolate each test.
+
+    The ruling's refusal path records the borrowed pair's fingerprints, and
+    those would otherwise leak into sibling tests that reuse the same token
+    literals (the pre-POST sidecar verdict would then refuse their refresh).
+    """
+    AA._SPENT_ROTATION_FINGERPRINTS.clear()
+    yield
+    AA._SPENT_ROTATION_FINGERPRINTS.clear()
+
+
 @pytest.fixture
 def hermes_home(tmp_path, monkeypatch):
     """Real on-disk HERMES_HOME so ``load_pool()`` re-reads what it persisted."""
@@ -145,15 +158,51 @@ def test_pool_store_sync_never_adopts_a_borrowed_row(hermes_home, claude_credent
     assert synced.refresh_token == _STALE_REFRESH
 
 
-def test_refresh_from_persisted_sanitized_row_keeps_the_full_pair(
+def test_refresh_from_persisted_sanitized_row_refuses_before_any_post(
     hermes_home, claude_credentials, monkeypatch
 ):
-    """The production ``load -> sanitize -> refresh`` path refreshes, not blanks.
+    """Owner ruling 2026-09-26: the production ``load -> sanitize -> refresh``
+    path must refuse a ``claude_code`` refresh before any POST and leave the
+    singleton untouched — never blank the pair, never spend the grant."""
+    posts = []
+    writes = []
+
+    def _counting_refresh(refresh_token, **kwargs):
+        posts.append(refresh_token)
+        return _rotating_refresh(refresh_token, **kwargs)
+
+    real_write = AA._write_claude_code_credentials
+
+    def _counting_write(access_token, refresh_token, expires_at_ms, **kwargs):
+        writes.append(refresh_token)
+        return real_write(access_token, refresh_token, expires_at_ms, **kwargs)
+
+    monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _counting_refresh)
+    monkeypatch.setattr(AA, "_write_claude_code_credentials", _counting_write)
+
+    pool = load_pool("anthropic")
+    entry = next(e for e in pool._entries if e.source == "claude_code")
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is None, "a borrowed-grant refresh must fail closed, not rotate"
+    assert posts == [], f"the ruling forbids the refresh POST, got {posts}"
+    assert writes == [], f"the ruling forbids the commit write, got {writes}"
+    assert _claude_pair(claude_credentials) == (_STALE_ACCESS, _STALE_REFRESH), (
+        "the refused refresh must leave the shared file exactly as it was"
+    )
+
+
+def test_refresh_with_borrow_optout_keeps_the_full_pair(
+    hermes_home, claude_credentials, monkeypatch
+):
+    """The ruling's explicit env opt-out restores the full rotation path.
 
     Exactly one POST and one authoritative write, the returned entry carries
-    the complete rotated pair, and the shared credentials file is the copy that
-    was updated.
+    the complete rotated pair, and the shared credentials file is the copy
+    that was updated.
     """
+    monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
     posts = []
     writes = []
 
@@ -231,7 +280,9 @@ def test_empty_oauth_entry_is_never_leased(hermes_home, claude_credentials):
 def test_selection_after_refresh_leases_only_hydrated_entries(
     hermes_home, claude_credentials, monkeypatch
 ):
-    """End-to-end: refresh through selection leaves a usable, non-empty lease."""
+    """End-to-end under the ruling's env opt-out: refresh through selection
+    leaves a usable, non-empty lease."""
+    monkeypatch.setenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", "1")
     monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _rotating_refresh)
 
     pool = load_pool("anthropic")
@@ -240,6 +291,32 @@ def test_selection_after_refresh_leases_only_hydrated_entries(
     assert available, "the credential must survive the refresh, not be dropped"
     assert all(e.access_token for e in available)
     assert any(e.access_token == _ROTATED_ACCESS for e in available)
+
+
+def test_selection_with_borrowing_off_never_leases_the_borrowed_grant(
+    hermes_home, claude_credentials, monkeypatch
+):
+    """Default (ruling) path: the borrowed claude_code grant must not be
+    leased — the refresh is refused, the entry is quarantined, and no
+    empty bearer can reach the available list."""
+    monkeypatch.delenv("HERMES_ALLOW_CLAUDE_CODE_BORROW", raising=False)
+    posts = []
+    monkeypatch.setattr(
+        AA, "refresh_anthropic_oauth_pure",
+        lambda rt, **kw: posts.append(rt) or _rotating_refresh(rt, **kw),
+    )
+
+    pool = load_pool("anthropic")
+    available, _pending = pool._available_entries(clear_expired=True, refresh=True)
+
+    assert posts == [], f"the ruling forbids the refresh POST, got {posts}"
+    assert all(e.access_token for e in available), (
+        "an OAuth entry with no access token must never be leased"
+    )
+    assert all(e.source != "claude_code" for e in available), (
+        "the refused borrowed grant must not be leased"
+    )
+    assert _claude_pair(claude_credentials) == (_STALE_ACCESS, _STALE_REFRESH)
 
 
 def test_hermes_pkce_row_still_syncs_from_the_pool_store(monkeypatch):
