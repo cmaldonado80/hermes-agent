@@ -45,12 +45,11 @@ import type {
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { Markdown } from "@/components/Markdown";
+import type { SessionFilterCategory, SourceSelectionsByCategory } from "./SessionsPage_sources";
 import {
   AUTOMATION_SESSION_SOURCES,
   NO_MATCHING_SESSION_SOURCE,
   SOURCE_CONFIG,
-  SessionFilterCategory,
-  SourceSelectionsByCategory,
   isAutomationSource,
   sourceBelongsToCategory,
   sourceLabel,
