@@ -1696,6 +1696,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 ),
                 store=str(source_path or "credential store"),
             ))
+        # Owner ruling 2026-09-26: one refresher per token. Never POST a refresh for a
+        # borrowed claude_code grant — Claude Code is the sole owner of that grant.
+        if entry.source == "claude_code" and not os.environ.get("HERMES_ALLOW_CLAUDE_CODE_BORROW") == "1":
+            raise _RefreshDone(self._fail_closed_unpersisted_rotation(
+                entry,
+                RuntimeError("claude_code grant borrowing is OFF (owner ruling 2026-09-26) - refresh refused"),
+                store=str(spent_rotation_source_path(entry.source) or "credential store"),
+            ))
         refreshed = refresh_anthropic_oauth_pure(entry.refresh_token, use_json=entry.source.endswith("hermes_pkce"))
         updated = replace(
             entry,
@@ -1774,6 +1782,15 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """
         if self.provider == "anthropic":
             if entry.source == "claude_code":
+                # Owner ruling 2026-09-26: never re-POST a spent borrowed grant's refresh;
+                # there is no legitimate recovery that spends Claude Code's token again.
+                if os.environ.get("HERMES_ALLOW_CLAUDE_CODE_BORROW") != "1":
+                    from agent.anthropic_credentials import spent_rotation_source_path as _spent_path
+                    raise _RefreshDone(self._fail_closed_unpersisted_rotation(
+                        entry,
+                        RuntimeError("claude_code grant borrowing is OFF (owner ruling 2026-09-26) - retry refused"),
+                        store=str(_spent_path(entry.source) or "credential store"),
+                    ))
                 synced = self._sync_anthropic_entry_from_credentials_file(entry)
                 if synced.refresh_token != entry.refresh_token:
                     logger.debug("Retrying refresh with synced token from credentials file")
