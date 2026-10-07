@@ -14,10 +14,7 @@ import { describe, expect, it } from 'vitest'
  * bundle-shape test precedent and keeps the test TTY-free.
  */
 
-const entrySource = readFileSync(
-  join(dirname(fileURLToPath(import.meta.url)), '..', 'entry.tsx'),
-  'utf8',
-)
+const entrySource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'entry.tsx'), 'utf8')
 
 const noTtyBlock = /if \(!process\.stdin\.isTTY\) \{[\s\S]*?\}/.exec(entrySource)
 
