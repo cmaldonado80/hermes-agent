@@ -75,11 +75,6 @@
     "kind": "bare_which"
   },
   {
-    "path": "cron/scheduler_delivery.py",
-    "symbol": "_deliver_to_bot_chat",
-    "kind": "bare_which"
-  },
-  {
     "path": "cron/scheduler_script.py",
     "symbol": "_script_argv",
     "kind": "bare_which"
@@ -140,11 +135,6 @@
   {
     "path": "hermes_cli/_subprocess_compat.py",
     "symbol": "resolve_node_command",
-    "kind": "bare_which"
-  },
-  {
-    "path": "hermes_cli/auth.py",
-    "symbol": "_external_process_spec",
     "kind": "bare_which"
   },
   {
@@ -330,11 +320,6 @@
   {
     "path": "hermes_cli/main_tui_launch.py",
     "symbol": "_tui_node_bin",
-    "kind": "bare_which"
-  },
-  {
-    "path": "hermes_cli/mcp_app_detection.py",
-    "symbol": "_Scan.path_candidates",
     "kind": "bare_which"
   },
   {
@@ -566,6 +551,16 @@
   {
     "path": "tools/mcp_tool_config.py",
     "symbol": "_managed_launcher",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/mcp_tool_config.py",
+    "symbol": "_outside_package",
+    "kind": "bare_which"
+  },
+  {
+    "path": "tools/mcp_tool_config.py",
+    "symbol": "_packaged_npx_entry",
     "kind": "bare_which"
   },
   {

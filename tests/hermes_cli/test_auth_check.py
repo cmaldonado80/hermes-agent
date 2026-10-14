@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from agent.credential_persistence import fingerprint_secret_value
 from hermes_cli.auth_check import (
