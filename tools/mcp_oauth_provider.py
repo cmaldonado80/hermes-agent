@@ -93,6 +93,10 @@ class HermesProviderMixin:
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
+        # oauth.scope — the SDK's 401 branch overwrites client_metadata.scope with the discovered
+        # scope (WWW-Authenticate, then PRM scopes_supported), so a configured narrower scope was
+        # never requested. Kept verbatim: offline_access is only sent if the config includes it.
+        self._hermes_configured_scope = self.context.client_metadata.scope
 
     async def _perform_authorization(self):
         info = self.context.client_info
@@ -103,6 +107,8 @@ class HermesProviderMixin:
             raise OAuthNonInteractiveError(
                 "MCP device authorization requires `hermes mcp login <server> --flow device`; "
                 "background reconnects cannot start a device login")
+        if getattr(self, "_hermes_configured_scope", None):
+            self.context.client_metadata.scope = self._hermes_configured_scope
         self._tolerate_missing_iss_for_known_server()
         self._request_google_offline_access()
         return await super()._perform_authorization()
