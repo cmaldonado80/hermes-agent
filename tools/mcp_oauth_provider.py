@@ -87,16 +87,18 @@ class HermesProviderMixin:
 
     _hermes_logger: logging.Logger = logger
 
-    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
+    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser",
+                 configured_scope: str | None = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self._hermes_oauth_flow = oauth_flow
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
-        # oauth.scope — the SDK's 401 branch overwrites client_metadata.scope with the discovered
-        # scope (WWW-Authenticate, then PRM scopes_supported), so a configured narrower scope was
-        # never requested. Kept verbatim: offline_access is only sent if the config includes it.
-        self._hermes_configured_scope = self.context.client_metadata.scope
+        # oauth.scope as the user wrote it (never a provider default such as Figma's) — the SDK's 401
+        # branch overwrites client_metadata.scope with the discovered scope (WWW-Authenticate, then PRM
+        # scopes_supported), so a configured narrower scope was never requested. Kept verbatim:
+        # offline_access is only sent if the config includes it.
+        self._hermes_configured_scope = configured_scope
 
     async def _perform_authorization(self):
         info = self.context.client_info
@@ -615,6 +617,7 @@ def prepare_oauth_config(server_name: str, server_url: str, oauth_config: dict |
     never leak back into the caller's config."""
     from tools import mcp_oauth as mo
     cfg = dict(oauth_config or {})
+    cfg["_configured_scope"] = cfg.get("scope") or None  # before provider defaults fill it in
     mo.apply_oauth_provider_defaults(cfg, server_name=server_name, server_url=server_url)
     return cfg, mo.HermesTokenStorage(server_name)
 
@@ -638,4 +641,5 @@ def build_provider_kwargs(cfg: dict, storage: HermesTokenStorage, *, ssh_proxy_h
         "callback_handler": mo._make_callback_waiter(port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))),
         "token_user_agent": mo.token_request_user_agent(cfg),
         "oauth_flow": cfg.get("flow", "browser"),
+        "configured_scope": cfg.get("_configured_scope"),
         **mo.cimd_provider_kwargs(cfg)}

@@ -20,7 +20,7 @@ class _AuthorizationUrlSeen(Exception):
     pass
 
 
-async def _authorization_scope(tmp_path, monkeypatch, scope: str | None) -> str | None:
+async def _authorization_scope(tmp_path, monkeypatch, scope: str | None, *, metadata_scope: str | None = None) -> str | None:
     from tools.mcp_tool import sdk_httpx
     httpx = sdk_httpx()
     from mcp.shared.auth import OAuthClientMetadata
@@ -45,10 +45,11 @@ async def _authorization_scope(tmp_path, monkeypatch, scope: str | None) -> str 
         server_url="https://example.com/mcp",
         client_metadata=OAuthClientMetadata(
             redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")], client_name="Hermes Agent",
-            grant_types=["authorization_code", "refresh_token"], scope=scope),
+            grant_types=["authorization_code", "refresh_token"], scope=metadata_scope or scope),
         storage=HermesTokenStorage("srv"),
         redirect_handler=redirect,
         callback_handler=callback,
+        configured_scope=scope,
     )
     prm = {"resource": "https://example.com/mcp", "authorization_servers": ["https://example.com"],
            "scopes_supported": _ALL_SCOPES}
@@ -96,3 +97,24 @@ async def test_configured_offline_access_is_kept(tmp_path, monkeypatch):
 async def test_without_configured_scope_discovery_still_decides(tmp_path, monkeypatch):
     scope = await _authorization_scope(tmp_path, monkeypatch, None)
     assert scope == " ".join(_ALL_SCOPES)
+
+
+@pytest.mark.asyncio
+async def test_provider_default_scope_does_not_pin(tmp_path, monkeypatch):
+    """Figma's injected ``mcp:connect`` default reaches client metadata, but it is not the user's
+    oauth.scope, so discovery still decides (and the SDK's 403 step-up union stays intact)."""
+    scope = await _authorization_scope(tmp_path, monkeypatch, None, metadata_scope="mcp:connect")
+    assert scope == " ".join(_ALL_SCOPES)
+
+
+@pytest.mark.parametrize("oauth_config, expected", [
+    ({"scope": "sessions:read devices:read"}, "sessions:read devices:read"),
+    ({}, None),
+])
+def test_prepare_oauth_config_records_only_the_users_scope(tmp_path, monkeypatch, oauth_config, expected):
+    from tools.mcp_oauth_provider import prepare_oauth_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg, _storage = prepare_oauth_config("figma", "https://mcp.figma.com/mcp", oauth_config)
+    assert cfg["scope"] == (expected or "mcp:connect")  # the Figma default still fills an unset scope
+    assert cfg["_configured_scope"] == expected
